@@ -24,36 +24,6 @@ interface InspirationGalleryProps {
   onRefreshGallery?: () => void;
 }
 
-const CATEGORIES_IMAGE = [
-  { name: '所有图片', count: 10972 },
-  { name: '真人人物', count: 2900 },
-  { name: '人物定妆照', count: 170 },
-  { name: '肖像', count: 649 },
-  { name: '产品', count: 760 },
-  { name: '广告/封面', count: 578 },
-  { name: '海报', count: 1193 },
-  { name: '用户界面/社交', count: 1500 },
-  { name: '角色', count: 945 },
-  { name: '比较', count: 2277 },
-];
-
-const CATEGORIES_VIDEO = [
-  { name: '所有视频', count: 5756 },
-  { name: '故事/电影', count: 1487 },
-  { name: '产品广告', count: 891 },
-  { name: '音乐视频', count: 93 },
-  { name: '动漫', count: 9 },
-  { name: '动作', count: 1180 },
-  { name: '时尚', count: 6 },
-  { name: '游戏', count: 301 },
-  { name: '恐怖', count: 130 },
-  { name: '喜剧', count: 109 },
-  { name: '旅行影像', count: 231 },
-  { name: 'Vlog', count: 164 },
-  { name: '动画', count: 960 },
-  { name: '产品演示', count: 84 },
-];
-
 const SOURCES = ['所有来源', 'X / Twitter', 'GitHub', '公共网页', '视频来源', '本地双轨', '扫描目录'];
 const LANGUAGES = ['所有语言', 'zh', 'en'];
 const MODELS = ['所有模型', 'minimax-h3', 'Seedance 2.0', 'kling-ai', 'runway-gen3', 'luma-dream', 'sora', 'pika-2', 'midjourney'];
@@ -88,7 +58,22 @@ export const InspirationGallery: React.FC<InspirationGalleryProps> = ({
   const bottomObserverRef = useRef<HTMLDivElement>(null);
   const deferredSearchQuery = useDeferredValue(searchQuery);
 
-  const activeCategories = activeMediaType === 'video' ? CATEGORIES_VIDEO : CATEGORIES_IMAGE;
+  // 动态统计分类数量（基于实际数据，而非写死常量）
+  const activeCategories = useMemo(() => {
+    const allLabel = activeMediaType === 'video' ? '所有视频' : '所有图片';
+    const typeItems = items.filter((item) => item.mediaType === activeMediaType || (!item.mediaType && activeMediaType === 'video'));
+    const counts = new Map<string, number>();
+    typeItems.forEach((item) => {
+      const name = item.category?.trim() || '未分类';
+      counts.set(name, (counts.get(name) || 0) + 1);
+    });
+    const sorted = [...counts.entries()].sort((a, b) => b[1] - a[1]);
+    return [
+      { name: allLabel, count: typeItems.length },
+      ...sorted.map(([name, count]) => ({ name, count })),
+    ];
+  }, [activeMediaType, items]);
+
   const galleryStats = useMemo(() => {
     const scannedCount = items.filter((item) => item.source === '扫描目录').length;
     const pendingPromptCount = items.filter((item) => {
