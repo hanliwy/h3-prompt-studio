@@ -2,6 +2,7 @@ import express from 'express';
 import path from 'path';
 import fs from 'fs';
 import net from 'net';
+import type { Server as HttpServer } from 'node:http';
 import { exec } from 'child_process';
 import dotenv from 'dotenv';
 import OpenAI from 'openai';
@@ -12,6 +13,7 @@ import {
   selectH3SkillForRequest,
 } from './src/server/h3SkillRuntime';
 import { runH3AgentGeneration, type H3AgentLlmCall } from './src/server/h3AgentRuntime';
+import { createH3OpenAiCall } from './src/server/h3OpenAiAdapter';
 import {
   isPathInsideRoots,
   mediaUrlForConfiguredRoots,
@@ -333,16 +335,31 @@ const INITIAL_GALLERY = [
   }
 ];
 
-async function startServer() {
+export interface StartServerOptions {
+  dataRoot?: string;
+  skillsRoot?: string;
+  distRoot?: string;
+  host?: string;
+  port?: number;
+}
+
+export interface StartedServer {
+  server: HttpServer;
+  host: string;
+  port: number;
+  url: string;
+}
+
+export async function startServer(options: StartServerOptions = {}): Promise<StartedServer> {
   const app = express();
-  const PORT = 3000;
 
   app.use(express.json({ limit: '20mb' }));
 
   // Ensure local data directories exist
-  const dataDir = path.join(process.cwd(), 'data');
-  const h3SkillsDir = path.join(dataDir, 'h3-skills');
-  const imageSkillsDir = path.join(dataDir, 'image-skills');
+  const dataDir = options.dataRoot || path.join(process.cwd(), 'data');
+  const skillsRoot = options.skillsRoot || dataDir;
+  const h3SkillsDir = path.join(skillsRoot, 'h3-skills');
+  const imageSkillsDir = path.join(skillsRoot, 'image-skills');
   const mediaDir = path.join(dataDir, 'media');
   const skillsFile = path.join(dataDir, 'skills.json');
   const galleryFile = path.join(dataDir, 'gallery.json');
@@ -948,41 +965,12 @@ async function startServer() {
     }
   });
 
-  // Convert internal AgentMessage (tool_calls as {id,name,args}) to OpenAI chat format
-  // (tool_calls as {id,type,function:{name,arguments:string}})
-  function toOpenAiMessage(m: any): any {
-    if (m.role === 'assistant' && Array.isArray(m.tool_calls) && m.tool_calls.length > 0) {
-      return {
-        role: 'assistant',
-        content: m.content || null,
-        tool_calls: m.tool_calls.map((tc: any) => ({
-          id: tc.id,
-          type: 'function' as const,
-          function: { name: tc.name, arguments: JSON.stringify(tc.args ?? {}) },
-        })),
-      };
-    }
-    if (m.role === 'tool') {
-      return { role: 'tool', tool_call_id: m.tool_call_id, content: m.content };
-    }
-    return { role: m.role, content: m.content };
-  }
-
   const createOfflineAgentCall = (): H3AgentLlmCall => async () => {
     throw new Error('当前 H3 Skill 工作流必须配置可用的 API Key；已禁用不执行真实 Skill 流程的离线伪结果。');
   };
 
   const isAbortError = (error: any, signal?: AbortSignal) =>
     signal?.aborted || error?.name === 'AbortError' || error?.code === 'ABORT_ERR';
-
-  const shouldRetryWithoutThinking = (error: any, signal?: AbortSignal) => {
-    if (isAbortError(error, signal)) return false;
-    const status = Number(error?.status || error?.statusCode || 0);
-    if (status !== 400 && status !== 422) return false;
-    const message = String(error?.message || error?.error?.message || '');
-    return /(thinking|reasoning[_ -]?effort)/i.test(message)
-      && /(unsupported|not supported|unknown|unrecognized|invalid|unexpected|parameter)/i.test(message);
-  };
 
   // Parse valid max_tokens range from provider error and auto-adjust
   const adjustMaxTokens = (error: any, completionParams: any): boolean => {
@@ -1216,100 +1204,13 @@ async function startServer() {
 
       const offlineAgentCall = createOfflineAgentCall();
       const callLlm: H3AgentLlmCall = client
-        ? async ({ systemPrompt, messages: loopMessages, tools, temperature, signal }) => {
-            const completionParams: any = {
-              model,
-              messages: [{ role: 'system', content: systemPrompt }, ...loopMessages.map(toOpenAiMessage)],
-              temperature,
-              stream: true,
-              max_tokens: 393216,
-            };
-            if (Array.isArray(tools) && tools.length > 0) {
-              completionParams.tools = tools.map((t) => ({ type: 'function', function: t.function }));
-              completionParams.tool_choice = 'auto';
-            }
-            if (h3Reasoning.applied) {
-              completionParams.thinking = { type: 'enabled' };
-              if (h3Reasoning.effort) completionParams.reasoning_effort = h3Reasoning.effort;
-            }
-
-            const runStream = async () => {
-              let content = '';
-              const toolCallMap = new Map<number, { id: string; name: string; argsRaw: string }>();
-              const stream = await client.chat.completions.create(completionParams, { signal });
-              for await (const chunk of stream as any) {
-                const delta = chunk.choices?.[0]?.delta;
-                if (delta?.reasoning_content) {
-                  content += delta.reasoning_content;
-                  send('delta', { text: delta.reasoning_content, kind: 'reasoning' });
-                }
-                if (delta?.content) {
-                  content += delta.content;
-                  send('delta', { text: delta.content, kind: 'content' });
-                }
-                if (Array.isArray(delta?.tool_calls)) {
-                  for (const tc of delta.tool_calls) {
-                    const idx = typeof tc.index === 'number' ? tc.index : 0;
-                    if (!toolCallMap.has(idx)) {
-                      toolCallMap.set(idx, { id: tc.id || '', name: '', argsRaw: '' });
-                    }
-                    const entry = toolCallMap.get(idx)!;
-                    if (tc.id) entry.id = tc.id;
-                    if (tc.function?.name) entry.name += tc.function.name;
-                    if (tc.function?.arguments) entry.argsRaw += tc.function.arguments;
-                  }
-                }
-              }
-              const tool_calls = Array.from(toolCallMap.values()).map((tc) => {
-                let args: Record<string, unknown> = {};
-                try {
-                  args = tc.argsRaw ? JSON.parse(tc.argsRaw) : {};
-                } catch {
-                  args = { _raw: tc.argsRaw };
-                }
-                return {
-                  id: tc.id || `call_${Math.random().toString(36).slice(2, 10)}`,
-                  name: tc.name,
-                  args,
-                };
-              });
-              return { content, tool_calls };
-            };
-
-            for (let attempt = 0; attempt < 4; attempt += 1) {
-              try {
-                return await runStream();
-              } catch (firstErr: any) {
-                if (isAbortError(firstErr, signal)) throw firstErr;
-                if (adjustMaxTokens(firstErr, completionParams)) {
-                  console.warn(`[H3 Agent Stream] Retry with adjusted max_tokens=${completionParams.max_tokens}`);
-                  continue;
-                }
-                const action = reasoningFallbackAction({
-                  status: Number(firstErr?.status || firstErr?.statusCode || 0),
-                  message: String(firstErr?.message || firstErr?.error?.message || ''),
-                });
-                if (action === 'drop-effort' && completionParams.reasoning_effort) {
-                  delete completionParams.reasoning_effort;
-                  h3Reasoning.effort = undefined;
-                  h3Reasoning.downgradeReason = '当前模型不支持思考强度，已保留思考模式。';
-                  send('stage', { stage: 'compatibility', message: h3Reasoning.downgradeReason });
-                  continue;
-                }
-                if (action === 'disable-thinking' && completionParams.thinking) {
-                  delete completionParams.thinking;
-                  delete completionParams.reasoning_effort;
-                  h3Reasoning.applied = false;
-                  h3Reasoning.effort = undefined;
-                  h3Reasoning.downgradeReason = '当前模型不支持思考模式，已自动关闭。';
-                  send('stage', { stage: 'compatibility', message: h3Reasoning.downgradeReason });
-                  continue;
-                }
-                throw firstErr;
-              }
-            }
-            throw new Error('模型兼容重试次数已用尽。');
-          }
+        ? createH3OpenAiCall({
+            client,
+            model,
+            reasoning: h3Reasoning,
+            onDelta: (text, kind) => send('delta', { text, kind }),
+            onCompatibility: (message) => send('stage', { stage: 'compatibility', message }),
+          })
         : offlineAgentCall;
 
       const agentResult = await runH3AgentGeneration({
@@ -1392,6 +1293,11 @@ async function startServer() {
       const apiKey = userApiKey || process.env.DEEPSEEK_API_KEY;
       const baseUrl = formatBaseUrl(userBaseUrl || customBaseUrl || process.env.DEEPSEEK_BASE_URL);
       const h3Skills = loadRuntimeH3Skills();
+      const h3Reasoning: ReasoningUsage = {
+        requested: thinkingEnabled,
+        applied: thinkingEnabled,
+        effort: thinkingEnabled ? reasoningEffort : undefined,
+      };
 
       const offlineAgentCall = createOfflineAgentCall();
 
@@ -1403,56 +1309,7 @@ async function startServer() {
         : null;
 
       const callLlm: H3AgentLlmCall = client
-        ? async ({ systemPrompt, messages: loopMessages, tools, temperature, signal }) => {
-            const completionParams: any = {
-              model,
-              messages: [{ role: 'system', content: systemPrompt }, ...loopMessages.map(toOpenAiMessage)],
-              temperature,
-            };
-            if (Array.isArray(tools) && tools.length > 0) {
-              completionParams.tools = tools.map((t) => ({ type: 'function', function: t.function }));
-              completionParams.tool_choice = 'auto';
-            }
-            if (thinkingEnabled) {
-              completionParams.thinking = { type: 'enabled' };
-              completionParams.reasoning_effort = reasoningEffort;
-            }
-
-            const runOnce = async () => {
-              const completion: any = await client.chat.completions.create(completionParams, { signal });
-              const msg = completion.choices?.[0]?.message;
-              const content = msg?.content || '';
-              const tool_calls = Array.isArray(msg?.tool_calls)
-                ? msg.tool_calls.map((tc: any) => {
-                    let args: Record<string, unknown> = {};
-                    try {
-                      args = tc.function?.arguments ? JSON.parse(tc.function.arguments) : {};
-                    } catch {
-                      args = { _raw: tc.function?.arguments };
-                    }
-                    return {
-                      id: tc.id || `call_${Math.random().toString(36).slice(2, 10)}`,
-                      name: tc.function?.name || '',
-                      args,
-                    };
-                  })
-                : [];
-              return { content, tool_calls };
-            };
-
-            try {
-              return await runOnce();
-            } catch (firstErr: any) {
-              if (isAbortError(firstErr, signal)) throw firstErr;
-              if (shouldRetryWithoutThinking(firstErr, signal)) {
-                console.warn('[H3 Agent] Retry without thinking params due to:', firstErr?.message);
-                delete completionParams.thinking;
-                delete completionParams.reasoning_effort;
-                return await runOnce();
-              }
-              throw firstErr;
-            }
-          }
+        ? createH3OpenAiCall({ client, model, reasoning: h3Reasoning })
         : offlineAgentCall;
 
       const agentResult = await runH3AgentGeneration({
@@ -1673,25 +1530,42 @@ Use restrained cinematic music that supports the selected style without overpowe
     });
     app.use(vite.middlewares);
   } else {
-    const distPath = path.join(process.cwd(), 'dist');
+    const distPath = options.distRoot || path.join(process.cwd(), 'dist');
     app.use(express.static(distPath));
     app.get('*', (req, res) => {
       res.sendFile(path.join(distPath, 'index.html'));
     });
   }
 
-  const preferredPort = parseInt(process.env.PORT || '3000', 10);
-  const actualPort = await findAvailablePort(preferredPort, '0.0.0.0');
+  const host = options.host || '0.0.0.0';
+  const preferredPort = options.port ?? parseInt(process.env.PORT || '3000', 10);
+  const actualPort = preferredPort === 0 ? 0 : await findAvailablePort(preferredPort, host);
 
-  if (actualPort !== preferredPort) {
+  if (preferredPort !== 0 && actualPort !== preferredPort) {
     console.warn(`[Server Warning] 端口兼容提示: 默认端口 ${preferredPort} 已被本地其他进程占用！系统已自动适配绑定可用端口: ${actualPort}`);
   }
 
-  app.listen(actualPort, '0.0.0.0', () => {
-    console.log(`[Server] MiniMax H3 Video Studio running on http://localhost:${actualPort}`);
+  const server = await new Promise<HttpServer>((resolve, reject) => {
+    const listener = app.listen(actualPort, host, () => {
+      listener.off('error', reject);
+      resolve(listener);
+    });
+    listener.once('error', reject);
   });
+
+  const address = server.address();
+  if (!address || typeof address === 'string') {
+    server.close();
+    throw new Error('服务器未返回有效的 TCP 监听地址。');
+  }
+  const urlHost = host === '0.0.0.0' ? 'localhost' : host;
+  const url = `http://${urlHost}:${address.port}`;
+  console.log(`[Server] MiniMax H3 Video Studio running on ${url}`);
+  return { server, host, port: address.port, url };
 }
 
-startServer().catch((err) => {
-  console.error('[Server Start Error]', err);
-});
+if (process.env.H3_SERVER_AUTO_START !== 'false') {
+  startServer().catch((err) => {
+    console.error('[Server Start Error]', err);
+  });
+}
