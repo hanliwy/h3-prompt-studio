@@ -16,19 +16,23 @@ assert(event.endsWith('\n\n'), 'ends as a complete SSE frame');
 assert(event.includes('line 1\\nline 2'), 'escapes raw newlines inside JSON payload');
 
 const serverSource = fs.readFileSync(path.join(process.cwd(), 'server.ts'), 'utf8');
+const h3AdapterSource = fs.readFileSync(
+  path.join(process.cwd(), 'src', 'server', 'h3OpenAiAdapter.ts'),
+  'utf8',
+);
 assert(serverSource.includes("req.on('aborted', abortRequest)"), 'request aborts are observed');
 assert(serverSource.includes('signal: requestController.signal'), 'request signal reaches the H3 runtime');
+assert(serverSource.includes('createH3OpenAiCall({'), 'server uses the H3 OpenAI adapter');
 assert(
-  serverSource.includes('chat.completions.create(completionParams, { signal })'),
+  h3AdapterSource.includes('chat.completions.create(completionParams, { signal })'),
   'request signal reaches the upstream OpenAI-compatible SDK call',
 );
-assert(serverSource.includes('shouldRetryWithoutThinking(firstErr, signal)'), 'thinking fallback is narrowly gated');
 assert(
-  serverSource.includes('status !== 400 && status !== 422'),
-  'thinking fallback requires an explicit client parameter error status',
+  h3AdapterSource.includes('reasoningFallbackAction({'),
+  'thinking fallback delegates to the narrowly gated compatibility policy',
 );
 assert(
-  !serverSource.includes('if (completionParams.thinking || completionParams.reasoning_effort)'),
+  !h3AdapterSource.includes('if (completionParams.thinking || completionParams.reasoning_effort)'),
   'generic model failures do not trigger a second upstream request',
 );
 

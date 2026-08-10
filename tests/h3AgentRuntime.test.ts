@@ -299,6 +299,34 @@ const baseOptions = {
   assert.equal(calls, 1, 'malformed JSON with no salvageable content rejects after one call');
 }
 
+// Plain text without the required tool call fails as a single protocol error.
+{
+  let calls = 0;
+  await assert.rejects(
+    () =>
+      runH3AgentGeneration({
+        userPrompt: '一个女孩',
+        skills,
+        skillsRoot,
+        callLlm: async () => {
+          calls += 1;
+          return {
+            content: '模型返回了普通正文，但没有提交结构化工具结果。',
+            tool_calls: [],
+          };
+        },
+        options: baseOptions,
+      }),
+    (error: unknown) => {
+      const message = error instanceof Error ? error.message : String(error);
+      assert.match(message, /没有调用 submit_generated_prompt|未按协议调用 submit_generated_prompt/);
+      assert.doesNotMatch(message, /integrated_multimodal_description|overall_soundscape|resolvedParams|中文对照/);
+      return true;
+    },
+  );
+  assert.equal(calls, 1, 'runtime must not retry or treat plain text as a final result');
+}
+
 // Cancellation after the first call prevents validation repair and returns promptly.
 {
   let calls = 0;
