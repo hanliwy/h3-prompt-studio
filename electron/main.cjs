@@ -1,8 +1,11 @@
-const { app, BrowserWindow, shell } = require('electron');
+const { app, BrowserWindow, shell, dialog } = require('electron');
 const path = require('path');
 const http = require('http');
 
 let mainWindow;
+let backendPromise;
+let backend;
+let backendClosing = false;
 
 // Wait for local Express server to start responding
 function waitForServer(url, timeout = 15000) {
@@ -32,32 +35,51 @@ function waitForServer(url, timeout = 15000) {
 
 // Start embedded Express backend
 function startBackendServer() {
+  if (backendPromise) return backendPromise;
   process.env.NODE_ENV = 'production';
-  process.env.PORT = process.env.PORT || '3000';
-  
-  try {
+  process.env.H3_SERVER_AUTO_START = 'false';
+
+  backendPromise = Promise.resolve().then(() => {
     const serverPath = path.join(__dirname, '../dist/server.cjs');
     console.log('[Electron Main] Launching embedded Express backend from:', serverPath);
-    require(serverPath);
-  } catch (err) {
-    console.error('[Electron Main] Failed to load server.cjs:', err);
-  }
+    const { startServer } = require(serverPath);
+    if (typeof startServer !== 'function') {
+      throw new Error('Embedded backend does not export startServer.');
+    }
+    const skillsRoot = app.isPackaged
+      ? path.join(process.resourcesPath, 'skills')
+      : path.join(app.getAppPath(), 'data');
+    return startServer({
+      dataRoot: path.join(app.getPath('userData'), 'data'),
+      skillsRoot,
+      distRoot: path.join(app.getAppPath(), 'dist'),
+      host: '127.0.0.1',
+      port: 0,
+    });
+  }).then((startedBackend) => {
+    backend = startedBackend;
+    return startedBackend;
+  }).catch((err) => {
+    backendPromise = null;
+    throw err;
+  });
+  return backendPromise;
 }
 
 async function createWindow() {
-  // 1. Boot embedded backend
-  startBackendServer();
-
-  const serverUrl = `http://localhost:${process.env.PORT || '3000'}`;
-
-  // 2. Wait for backend readiness
+  let backend;
   try {
-    await waitForServer(serverUrl, 12000);
+    backend = await startBackendServer();
+    await waitForServer(`${backend.url}/api/health`, 12000);
   } catch (err) {
-    console.warn('[Electron Main] Wait for server warning:', err?.message || err);
+    const message = err?.message || String(err);
+    console.error('[Electron Main] Failed to start embedded backend:', err);
+    dialog.showErrorBox('MiniMax-H3 PromptMaster 启动失败', message);
+    app.quit();
+    return;
   }
+  const serverUrl = backend.url;
 
-  // 3. Create Desktop Window
   mainWindow = new BrowserWindow({
     width: 1280,
     height: 850,
@@ -95,16 +117,35 @@ async function createWindow() {
   });
 }
 
-app.whenReady().then(createWindow);
+const hasSingleInstanceLock = app.requestSingleInstanceLock();
 
-app.on('window-all-closed', () => {
-  if (process.platform !== 'darwin') {
-    app.quit();
-  }
-});
+if (!hasSingleInstanceLock) {
+  app.quit();
+} else {
+  app.on('second-instance', () => {
+    if (!mainWindow) return;
+    if (mainWindow.isMinimized()) mainWindow.restore();
+    mainWindow.focus();
+  });
 
-app.on('activate', () => {
-  if (BrowserWindow.getAllWindows().length === 0) {
-    createWindow();
-  }
-});
+  app.whenReady().then(createWindow);
+
+  app.on('before-quit', (event) => {
+    if (backendClosing || !backend?.server?.listening) return;
+    event.preventDefault();
+    backendClosing = true;
+    backend.server.close(() => app.quit());
+  });
+
+  app.on('window-all-closed', () => {
+    if (process.platform !== 'darwin') {
+      app.quit();
+    }
+  });
+
+  app.on('activate', () => {
+    if (BrowserWindow.getAllWindows().length === 0) {
+      createWindow();
+    }
+  });
+}

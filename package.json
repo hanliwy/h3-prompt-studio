@@ -1,7 +1,7 @@
 {
   "name": "minimax-h3-prompt-master",
   "private": true,
-  "version": "1.0.1",
+  "version": "1.0.2",
   "type": "module",
   "main": "electron/main.cjs",
   "scripts": {
@@ -14,9 +14,10 @@
     "dist:all": "npm run build && electron-builder -mwl",
     "clean": "rm -rf dist release server.cjs",
     "lint": "tsc --noEmit",
-    "test": "npm run test:h3-skills && npm run test:h3-agent && npm run test:image-skills && npm run test:image-style-randomization && npm run test:generation-controllers && npm run test:image-prompt && npm run test:image-server && npm run test:gallery-scanner && npm run test:history-store && npm run test:sse && npm run test:layout && npm run test:navbar",
+    "test": "npm run test:h3-skills && npm run test:h3-agent && npm run test:h3-openai-adapter && npm run test:image-skills && npm run test:image-style-randomization && npm run test:generation-controllers && npm run test:image-prompt && npm run test:image-server && npm run test:gallery-scanner && npm run test:history-store && npm run test:electron-packaging && npm run test:server-lifecycle && npm run test:sse && npm run test:layout && npm run test:navbar",
     "test:h3-skills": "tsx tests/h3SkillRuntime.test.ts",
     "test:h3-agent": "tsx tests/h3AgentRuntime.test.ts && tsx tests/h3AgentRuntime.next.test.ts",
+    "test:h3-openai-adapter": "tsx tests/h3OpenAiAdapter.test.ts",
     "test:image-skills": "tsx tests/imageSkillRuntime.test.ts",
     "test:image-style-randomization": "tsx tests/imageStyleRandomization.test.ts",
     "test:generation-controllers": "tsx tests/generationControllerIsolation.test.ts",
@@ -24,6 +25,8 @@
     "test:image-server": "tsx tests/imagePromptServer.test.ts",
     "test:gallery-scanner": "tsx tests/galleryScanner.test.ts",
     "test:history-store": "tsx tests/historyStore.test.ts",
+    "test:electron-packaging": "tsx tests/electronPackaging.test.ts",
+    "test:server-lifecycle": "tsx tests/serverLifecycle.test.ts",
     "test:sse": "tsx tests/sse.test.ts",
     "test:layout": "tsx tests/promptGeneratorLayout.test.ts",
     "test:navbar": "tsx tests/navbarBranding.test.ts"

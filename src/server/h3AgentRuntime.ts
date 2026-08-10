@@ -498,6 +498,9 @@ export async function runH3AgentGeneration({
   emit?.({ type: 'turn_end', turn: 1 });
 
   let parsed = parseGeneration(firstResponse);
+  if (!parsed.submission) {
+    throw new Error(parsed.issues[0] || '模型未按协议调用 submit_generated_prompt。');
+  }
   let built = buildResult(parsed, selectedSkill, userPrompt, runtimeOptions, false, trace);
   trace.push('第 1 次模型调用完成服务器专属校验');
 

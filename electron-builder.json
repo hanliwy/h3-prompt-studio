@@ -11,6 +11,16 @@
     "electron/**/*",
     "package.json"
   ],
+  "extraResources": [
+    {
+      "from": "data/h3-skills",
+      "to": "skills/h3-skills"
+    },
+    {
+      "from": "data/image-skills",
+      "to": "skills/image-skills"
+    }
+  ],
   "win": {
     "target": [
       {

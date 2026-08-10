@@ -4,6 +4,38 @@
 
 ---
 
+## 界面预览
+
+<p align="center">
+  <img src="src/docs/images/1.png" alt="MiniMax-H3 Prompt Studio 首页" width="100%">
+</p>
+
+<p align="center"><strong>首页与提示词生成工作台</strong></p>
+
+<table>
+  <tr>
+    <td width="50%"><img src="src/docs/images/2.png" alt="首个预设提示词生成界面" width="100%"></td>
+    <td width="50%"><img src="src/docs/images/3.png" alt="多参数组合提示词生成界面" width="100%"></td>
+  </tr>
+  <tr>
+    <td align="center"><strong>预设生成界面</strong></td>
+    <td align="center"><strong>多参数组合与末尾预设</strong></td>
+  </tr>
+</table>
+
+<table>
+  <tr>
+    <td width="50%"><img src="src/docs/images/4.png" alt="大模型 API 配置界面" width="100%"></td>
+    <td width="50%"><img src="src/docs/images/5.png" alt="图片反推 API 配置界面" width="100%"></td>
+  </tr>
+  <tr>
+    <td align="center"><strong>大模型 API 配置</strong></td>
+    <td align="center"><strong>图片反推 API 配置</strong></td>
+  </tr>
+</table>
+
+---
+
 ## 目录
 1. [核心特色与设计理念](#核心特色与设计理念)
 2. [本地数据存储与同名视频/图片匹配机制](#本地数据存储与同名视频图片匹配机制)
