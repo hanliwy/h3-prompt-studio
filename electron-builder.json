@@ -6,6 +6,11 @@
   "directories": {
     "output": "release"
   },
+  "publish": {
+    "provider": "github",
+    "owner": "hanliwy",
+    "repo": "h3-prompt-studio"
+  },
   "files": [
     "dist/**/*",
     "electron/**/*",
