@@ -46,9 +46,9 @@ const PROVIDER_TEMPLATES: Array<{
   },
   {
     name: 'OpenCode / OpenCodeGo 套餐',
-    baseUrl: 'https://api.opencode.ai/v1',
-    defaultModel: 'opencode-go',
-    popularModels: ['opencode-go', 'opencode-go-pro', 'opencode-go-flash', 'deepseek-v3', 'deepseek-r1'],
+    baseUrl: 'https://opencode.ai/zen/go/v1',
+    defaultModel: 'deepseek-v4-flash',
+    popularModels: ['glm5', 'glm5.1', 'mimo-2.5', 'deepseek-v4-pro', 'deepseek-v4-flash'],
     desc: 'OpenCode 官方中转 API 与 OpenCodeGo 订阅套餐',
   },
   {

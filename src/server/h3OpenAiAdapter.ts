@@ -23,11 +23,30 @@ const isAbortError = (error: any, signal?: AbortSignal) =>
 
 const adjustMaxTokens = (error: any, completionParams: Record<string, any>) => {
   const message = String(error?.message || error?.error?.message || '');
+  // 兼容多种文案：`max_tokens [a, b]` 范围、`supports at most N` 上限、
+  // 以及 `maximum context length is N ... x of text input, y of tool input` 上下文超限
+  let maxAllowed = 0;
   const rangeMatch = message.match(/max_tokens.*?\[(\d+),\s*(\d+)\]/i);
-  if (!rangeMatch) return false;
-  const maxAllowed = Number.parseInt(rangeMatch[2], 10);
+  if (rangeMatch) {
+    maxAllowed = Number.parseInt(rangeMatch[2], 10);
+  } else {
+    const atMostMatch = message.match(/supports at most (\d+)/i);
+    if (atMostMatch) {
+      maxAllowed = Number.parseInt(atMostMatch[1], 10);
+    } else {
+      const contextMatch = message.match(/maximum context length is (\d+)/i);
+      if (contextMatch) {
+        const contextLimit = Number.parseInt(contextMatch[1], 10);
+        const textTokens = Number.parseInt(message.match(/(\d+) of text input/i)?.[1] || '0', 10);
+        const toolTokens = Number.parseInt(message.match(/(\d+) of tool input/i)?.[1] || '0', 10);
+        // 上下文上限减去输入 token，并留 512 token 余量
+        maxAllowed = contextLimit - textTokens - toolTokens - 512;
+      }
+    }
+  }
+  if (maxAllowed <= 0) return false;
   const current = Number(completionParams.max_tokens || 0);
-  if (maxAllowed <= 0 || current <= maxAllowed) return false;
+  if (current <= maxAllowed) return false;
   completionParams.max_tokens = maxAllowed;
   return true;
 };
@@ -135,10 +154,10 @@ export function createH3OpenAiCall({
       return false;
     };
 
-    const runStream = async () => {
+    const runStream = async (params: Record<string, any> = completionParams) => {
       let content = '';
       const toolCallMap = new Map<number, { id: string; name: string; argsRaw: string }>();
-      const stream = await client.chat.completions.create(completionParams, { signal });
+      const stream = await client.chat.completions.create(params, { signal });
       for await (const chunk of stream as any) {
         const delta = chunk.choices?.[0]?.delta;
         if (delta?.reasoning_content) {
@@ -221,15 +240,33 @@ export function createH3OpenAiCall({
         onCompatibility?.(reasoning.downgradeReason);
       }
     }
+    if (submitToolOnly && Array.isArray(repairParams.messages)) {
+      repairParams.messages = [
+        ...repairParams.messages,
+        {
+          role: 'user',
+          content: '以上结果未通过服务器校验。你必须直接调用 submit_generated_prompt 工具提交唯一完整结果，禁止输出普通文本回复或解释。',
+        },
+      ];
+    }
     let repairCompletion: any;
     for (let attempt = 0; attempt < 4; attempt += 1) {
       try {
+        if (repairParams.stream) {
+          // 部分渠道仅流式支持工具调用：流式重试
+          const streamed = await runStream(repairParams);
+          if (streamed.tool_calls.length === 0) {
+            throw new Error('当前渠道在流式及非流式模式下均未返回强制工具调用 submit_generated_prompt，无法安全接收唯一结构化结果。');
+          }
+          return { content: streamed.content, tool_calls: streamed.tool_calls };
+        }
         repairCompletion = await client.chat.completions.create(repairParams, { signal });
         const repairMessage = repairCompletion.choices?.[0]?.message;
         const repairToolCalls = Array.isArray(repairMessage?.tool_calls) ? repairMessage.tool_calls : [];
         if (repairToolCalls.length > 0) break;
-        // 无工具调用且无法再降级：退出循环，统一报错
-        break;
+        // 非流式未返回工具调用：改用流式再试
+        repairParams.stream = true;
+        repairCompletion = undefined;
       } catch (error: any) {
         if (isAbortError(error, signal)) throw error;
         if (adjustMaxTokens(error, repairParams)) continue;
