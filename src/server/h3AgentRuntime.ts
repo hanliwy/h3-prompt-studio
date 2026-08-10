@@ -184,10 +184,13 @@ function buildSystemPrompt(
   const gavenStyleBlock = options.gavenStyleCodes
     ? `\n用户指定画风组合：${options.gavenStyleCodes}。必须从上方 Skill 的画风参考文件中读取对应条目，把 Dxx（导演视觉语言）、Pxx（摄影风格）、Cxx（拍摄胶片）、Rxx（印片风格）与 S（强度）每一层都完整展开为自包含的自然视觉语言，写入成品的"视觉风格"段。不得遗漏任何选定的画风层级，不得用导演姓名或画风代码代替具体描述。展开后不得在成品中保留任何画风代码、括号标注（如（D13）（P03））或"受……启发"引用。`
     : '';
+  const nativeSkillDirective = config.outputFormat === 'native-skill'
+    ? '本 Skill 为中文原生格式：result.promptEn 与 result.promptCn 必须完全相同，都输出同一份完整中文成品（首行以"生成一段"开头）。result.promptEn 严禁翻译成英文。'
+    : '最终成品 result.promptEn 使用英文，result.promptCn 使用中文。';
   return `你是 MiniMax-H3 视频提示词执行器。服务器已锁定唯一 Skill 并加载全部必需规则，不做路由，不向用户提问，不返回候选，不输出工作流草稿。${gavenStyleBlock}
 
 重要：不要输出冗长的思考过程、大纲、自检表或分镜规划文本。直接调用 submit_generated_prompt 提交完整成品。内容部分（result.promptEn）必须包含完整提示词，不要把提示词写在中间分析里。
-如果需要输出任何中间文本（包括思考过程），请全部使用中文。最终成品 result.promptEn 使用英文，result.promptCn 使用中文。
+如果需要输出任何中间文本（包括思考过程），请全部使用中文。${nativeSkillDirective}
 
 固定工作流参数：Skill=${selectedSkill.id}；inputMode=${options.inputMode || 'text'}；sceneMode=${options.sceneMode || '不适用'}；duration=${duration}；aspectRatio=${aspectRatio}；motionSpeed=${options.motionSpeed || 7}。
 
@@ -398,9 +401,13 @@ function reviewResult(
 ): H3AgentReview {
   const config = getH3SkillWorkflowConfig(selectedSkill.id);
   const duration = config.fixedDuration || options.duration || selectedSkill.recommendedParams.duration;
+  // 中文原生 Skill（SKILL.cn.md）：格式校验以模型输出的中文成品（promptCn）为准，promptEn 可能被模型写成英文
+  const isNativeSkill = config.outputFormat === 'native-skill'
+    || (Array.isArray(config.requiredRuntimeFiles) && config.requiredRuntimeFiles.includes('SKILL.cn.md'));
+  const promptText = isNativeSkill && result.promptCn.trim() ? result.promptCn : result.promptEn;
   const validation = validateSkillOutput({
     skillId: selectedSkill.id,
-    promptText: result.promptEn,
+    promptText,
     duration,
     inputMode: options.inputMode || 'text',
     sceneMode: options.sceneMode,

@@ -143,7 +143,7 @@ export type ReasoningFallbackAction = 'drop-effort' | 'disable-thinking' | 'none
 export function reasoningFallbackAction(error: { status?: number; message?: string }): ReasoningFallbackAction {
   if (error.status !== 400 && error.status !== 422) return 'none';
   const message = error.message || '';
-  const unsupported = /(unsupported|unknown|invalid|unexpected|parameter|不支持|未知参数)/i.test(message);
+  const unsupported = /(unsupported|not supported|does not support|doesn't support|unknown|invalid|unexpected|parameter|不支持|未知参数)/i.test(message);
   if (!unsupported) return 'none';
   if (/reasoning[_ -]?effort/i.test(message)) return 'drop-effort';
   if (/thinking/i.test(message)) return 'disable-thinking';
