@@ -24,7 +24,7 @@ assert(serverSource.includes("req.on('aborted', abortRequest)"), 'request aborts
 assert(serverSource.includes('signal: requestController.signal'), 'request signal reaches the H3 runtime');
 assert(serverSource.includes('createH3OpenAiCall({'), 'server uses the H3 OpenAI adapter');
 assert(
-  h3AdapterSource.includes('chat.completions.create(completionParams, { signal })'),
+  /chat\.completions\.create\((completionParams|params), \{ signal \}\)/.test(h3AdapterSource),
   'request signal reaches the upstream OpenAI-compatible SDK call',
 );
 assert(
