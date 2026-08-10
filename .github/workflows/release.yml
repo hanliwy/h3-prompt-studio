@@ -34,7 +34,8 @@ jobs:
 
       - name: Build & Package Desktop App
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # electron-builder 要求 GH_TOKEN（不是 GITHUB_TOKEN）才会真正上传到 Release
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           # CI 无 Apple 签名证书，跳过 macOS 代码签名/公证
           CSC_IDENTITY_AUTO_DISCOVERY: 'false'
         run: npx electron-builder --publish always
