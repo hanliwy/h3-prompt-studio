@@ -35,4 +35,20 @@ jobs:
       - name: Build & Package Desktop App
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # CI 无 Apple 签名证书，跳过 macOS 代码签名/公证
+          CSC_IDENTITY_AUTO_DISCOVERY: 'false'
         run: npx electron-builder --publish always
+
+      - name: Upload artifacts (fallback)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: desktop-build-${{ matrix.os }}
+          path: |
+            release/*.exe
+            release/*.dmg
+            release/*.zip
+            release/*.AppImage
+            release/*.yml
+            release/*.blockmap
+          if-no-files-found: ignore

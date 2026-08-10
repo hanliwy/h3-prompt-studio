@@ -93,14 +93,47 @@ export function createH3OpenAiCall({
 
     if (Array.isArray(tools) && tools.length > 0) {
       completionParams.tools = tools.map((tool) => ({ type: 'function', function: tool.function }));
-      completionParams.tool_choice = submitToolOnly
-        ? { type: 'function', function: { name: 'submit_generated_prompt' } }
-        : 'auto';
+      // 思考模式下省略 tool_choice（默认 auto）：部分渠道（如 OpenCode Go）对 thinking+tool_choice 直接 400
+      if (submitToolOnly && !reasoning?.applied) {
+        completionParams.tool_choice = { type: 'function', function: { name: 'submit_generated_prompt' } };
+      }
     }
     if (reasoning?.applied) {
       completionParams.thinking = { type: 'enabled' };
       if (reasoning.effort) completionParams.reasoning_effort = reasoning.effort;
     }
+
+    const applyReasoningFallback = (error: any, params: Record<string, any>) => {
+      const action = reasoningFallbackAction({
+        status: Number(error?.status || error?.statusCode || 0),
+        message: String(error?.message || error?.error?.message || ''),
+      });
+      if (action === 'drop-effort' && params.reasoning_effort) {
+        delete params.reasoning_effort;
+        if (reasoning) {
+          reasoning.effort = undefined;
+          reasoning.downgradeReason = '当前模型不支持思考强度，已保留思考模式。';
+          onCompatibility?.(reasoning.downgradeReason);
+        }
+        return true;
+      }
+      if (action === 'disable-thinking' && params.thinking) {
+        delete params.thinking;
+        delete params.reasoning_effort;
+        // 思考模式关闭后可重新强制唯一工具调用
+        if (submitToolOnly) {
+          params.tool_choice = { type: 'function', function: { name: 'submit_generated_prompt' } };
+        }
+        if (reasoning) {
+          reasoning.applied = false;
+          reasoning.effort = undefined;
+          reasoning.downgradeReason = '当前模型不支持思考模式，已自动关闭。';
+          onCompatibility?.(reasoning.downgradeReason);
+        }
+        return true;
+      }
+      return false;
+    };
 
     const runStream = async () => {
       let content = '';
@@ -145,41 +178,66 @@ export function createH3OpenAiCall({
       } catch (error: any) {
         if (isAbortError(error, signal)) throw error;
         if (adjustMaxTokens(error, completionParams)) continue;
-        const action = reasoningFallbackAction({
-          status: Number(error?.status || error?.statusCode || 0),
-          message: String(error?.message || error?.error?.message || ''),
-        });
-        if (action === 'drop-effort' && completionParams.reasoning_effort) {
-          delete completionParams.reasoning_effort;
-          if (reasoning) {
-            reasoning.effort = undefined;
-            reasoning.downgradeReason = '当前模型不支持思考强度，已保留思考模式。';
-            onCompatibility?.(reasoning.downgradeReason);
-          }
-          continue;
-        }
-        if (action === 'disable-thinking' && completionParams.thinking) {
-          delete completionParams.thinking;
-          delete completionParams.reasoning_effort;
-          if (reasoning) {
-            reasoning.applied = false;
-            reasoning.effort = undefined;
-            reasoning.downgradeReason = '当前模型不支持思考模式，已自动关闭。';
-            onCompatibility?.(reasoning.downgradeReason);
-          }
-          continue;
-        }
+        if (applyReasoningFallback(error, completionParams)) continue;
         throw error;
       }
     }
     if (!streamedResult) throw new Error('模型兼容重试次数已用尽。');
+    // 唯一工具提交被截断（JSON 解析失败）且思考模式开启：思考占用输出预算，关闭后重新生成完整成品
+    const isSubmissionTruncated = submitToolOnly
+      && streamedResult.tool_calls.some((tc) => tc && '_raw' in (tc.args || {}));
+    if (isSubmissionTruncated && completionParams.thinking && reasoning) {
+      delete completionParams.thinking;
+      delete completionParams.reasoning_effort;
+      completionParams.tool_choice = { type: 'function', function: { name: 'submit_generated_prompt' } };
+      reasoning.applied = false;
+      reasoning.effort = undefined;
+      reasoning.downgradeReason = '生成内容过长导致结果被截断，已自动关闭思考模式重新生成完整成品。';
+      onCompatibility?.(reasoning.downgradeReason);
+      try {
+        streamedResult = await runStream();
+      } catch (error: any) {
+        if (isAbortError(error, signal)) throw error;
+        // 重新生成失败则保留原截断结果，交由后续修复流程兜底
+      }
+    }
     if (streamedResult.tool_calls.length > 0 || !submitToolOnly) return streamedResult;
     if (signal?.aborted) {
       throw signal.reason instanceof Error ? signal.reason : new DOMException('生成已取消。', 'AbortError');
     }
 
-    const repairParams = { ...completionParams, stream: false };
-    const repairCompletion = await client.chat.completions.create(repairParams, { signal });
+    const repairParams: Record<string, any> = { ...completionParams, stream: false };
+    // repair 目标只是拿回工具调用；关闭思考，避免非流式 thinking+tool_choice 在部分渠道 400
+    if (repairParams.thinking) {
+      delete repairParams.thinking;
+      delete repairParams.reasoning_effort;
+      repairParams.tool_choice = submitToolOnly
+        ? { type: 'function', function: { name: 'submit_generated_prompt' } }
+        : 'auto';
+      if (reasoning) {
+        reasoning.applied = false;
+        reasoning.effort = undefined;
+        reasoning.downgradeReason = '结果补全阶段已自动关闭思考模式。';
+        onCompatibility?.(reasoning.downgradeReason);
+      }
+    }
+    let repairCompletion: any;
+    for (let attempt = 0; attempt < 4; attempt += 1) {
+      try {
+        repairCompletion = await client.chat.completions.create(repairParams, { signal });
+        const repairMessage = repairCompletion.choices?.[0]?.message;
+        const repairToolCalls = Array.isArray(repairMessage?.tool_calls) ? repairMessage.tool_calls : [];
+        if (repairToolCalls.length > 0) break;
+        // 无工具调用且无法再降级：退出循环，统一报错
+        break;
+      } catch (error: any) {
+        if (isAbortError(error, signal)) throw error;
+        if (adjustMaxTokens(error, repairParams)) continue;
+        if (applyReasoningFallback(error, repairParams)) continue;
+        throw error;
+      }
+    }
+    if (!repairCompletion) throw new Error('模型兼容重试次数已用尽。');
     const repairMessage = repairCompletion.choices?.[0]?.message;
     const repairToolCalls = Array.isArray(repairMessage?.tool_calls)
       ? repairMessage.tool_calls.map(parseToolCall)
