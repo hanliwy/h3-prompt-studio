@@ -1,0 +1,6 @@
+{
+  "name": "MiniMax H3 Video Prompt Studio",
+  "description": "DeepSeek-powered AI Video Prompt Generator & Gallery based on MiniMax-H3 prompt engineering rules.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
