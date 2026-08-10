@@ -215,9 +215,9 @@ export const DeepSeekKeyModal: React.FC<UniversalApiSettingsModalProps> = ({
       {
         id: 'opencode-preset',
         name: 'OpenCode / OpenCodeGo 套餐',
-        baseUrl: 'https://api.opencode.ai/v1',
+        baseUrl: 'https://opencode.ai/zen/go/v1',
         apiKey: '',
-        model: 'opencode-go',
+        model: 'deepseek-v4-flash',
         thinkingEnabled: true,
         reasoningEffort: 'high',
         temperature: 0.7,
