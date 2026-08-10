@@ -1,0 +1,12 @@
+name: h3-multimode-5s
+title: H3 5秒三流程导演模板
+duration: 5s
+aspect_ratio: 16:9
+scene_modes:
+  - drama
+  - action
+  - storyboard-grid
+input_modes:
+  - text
+  - image
+image_mode_status: planned
