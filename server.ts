@@ -14,6 +14,7 @@ import {
 } from './src/server/h3SkillRuntime';
 import { runH3AgentGeneration, type H3AgentLlmCall } from './src/server/h3AgentRuntime';
 import { createH3OpenAiCall } from './src/server/h3OpenAiAdapter';
+import { runFreeformAgentLoop } from './src/server/freeformAgentLoop';
 import {
   isPathInsideRoots,
   mediaUrlForConfiguredRoots,
@@ -38,7 +39,8 @@ import {
   parseImagePromptCanonical,
   reasoningFallbackAction,
 } from './src/server/imagePromptRuntime';
-import type { AspectRatio, ImagePromptFormat, ReasoningUsage } from './src/types';
+import { resolveEffectiveVariantCount } from './src/server/promptVariantCount';
+import type { AspectRatio, ImagePromptFormat, ReasoningUsage, StructuredPromptOutput } from './src/types';
 
 dotenv.config();
 
@@ -969,6 +971,208 @@ export async function startServer(options: StartServerOptions = {}): Promise<Sta
     throw new Error('当前 H3 Skill 工作流必须配置可用的 API Key；已禁用不执行真实 Skill 流程的离线伪结果。');
   };
 
+  // 加载所选 Skill 的主规则 + references/ 全部参考，供直接推理注入 system prompt
+  // 自适应：无需白名单配置，新放入 h3-skills/ 的 Skill 也能自动读到。总量截断 8 万字符。
+  const loadSkillContextForDirect = (skill: any, skillsRoot?: string): { context: string; loadedFiles: string[] } => {
+    if (!skill?.folder || !skillsRoot) return { context: '', loadedFiles: [] };
+    const skillDir = path.resolve(skillsRoot, skill.folder);
+    if (!fs.existsSync(skillDir)) return { context: '', loadedFiles: [] };
+    const MAX_CHARS = 80000;
+    const sections: string[] = [];
+    const loadedFiles: string[] = [];
+    let remaining = MAX_CHARS;
+    // 主文件：优先 SKILL.cn.md，其次 SKILL.md（只读一个）
+    for (const mainFile of ['SKILL.cn.md', 'SKILL.md']) {
+      const resolved = path.resolve(skillDir, mainFile);
+      if (fs.existsSync(resolved) && fs.statSync(resolved).isFile()) {
+        const content = fs.readFileSync(resolved, 'utf-8').slice(0, remaining);
+        sections.push(`=== ${skill.id || skill.folder}/${mainFile} ===\n${content}`);
+        loadedFiles.push(mainFile);
+        remaining -= content.length;
+        break;
+      }
+    }
+    // references/ 目录下全部 .md/.txt（按文件名排序，逐一截断到剩余配额）
+    const refsDir = path.resolve(skillDir, 'references');
+    if (remaining > 0 && fs.existsSync(refsDir) && fs.statSync(refsDir).isDirectory()) {
+      const refFiles = fs.readdirSync(refsDir).filter((f) => /\.(md|txt)$/i.test(f)).sort();
+      for (const f of refFiles) {
+        if (remaining <= 0) break;
+        const resolved = path.resolve(refsDir, f);
+        const content = fs.readFileSync(resolved, 'utf-8').slice(0, remaining);
+        sections.push(`=== ${skill.id || skill.folder}/references/${f} ===\n${content}`);
+        loadedFiles.push(`references/${f}`);
+        remaining -= content.length;
+      }
+    }
+    return { context: sections.join('\n\n'), loadedFiles };
+  };
+
+  // 直接推理模式：单轮 LLM 调用，加载所选 Skill 完整规则（主文件+references），不做格式校验
+  // 适用于速度优先、关键信息已明确的场景
+  // 多组时一次调用产出 N 组结果，后端按 ===第N组=== 分隔符拆分（比循环调用快 N 倍）
+  const runDirectPromptGeneration = async ({
+    client,
+    model,
+    userPrompt,
+    options,
+    skill,
+    variantTotal = 1,
+    variantDirections = [],
+    onDelta,
+    onCompatibility,
+    signal,
+    skillsRoot,
+  }: {
+    client: OpenAI;
+    model: string;
+    userPrompt: string;
+    options: any;
+    skill: any;
+    variantTotal?: number;
+    variantDirections?: Array<{ label: string; hint: string }>;
+    onDelta?: (text: string, kind: string) => void;
+    onCompatibility?: (message: string) => void;
+    signal: AbortSignal;
+    skillsRoot?: string;
+  }): Promise<StructuredPromptOutput[]> => {
+    const isMultiVariant = variantTotal > 1;
+    const dialogueHint = (() => {
+      switch (options.dialogueMode) {
+        case 'dialogue': return '人物必须在画面中实际开口说话，台词用中文双引号 "…" 包裹写入画面时间线段（不放进声音段）。';
+        case 'voiceover': return '使用画外音 voiceover，台词用中文双引号 "…" 包裹，并说明"画面中人物嘴唇保持完全闭合"。';
+        case 'lyrics': return '人物必须在画面中唱歌，歌词用中文双引号 "…" 包裹写入画面段。';
+        case 'no-human-voice': return '全文不得出现任何对白、旁白、歌词或人声演唱。';
+        default: return '若画面意图暗示人物说话，按对白规则处理；否则保留为纯环境声。';
+      }
+    })();
+
+    const duration = options.duration || '6s';
+    const aspectRatio = options.aspectRatio || '16:9';
+    const durationSeconds = String(duration).replace(/[^0-9]/g, '') || '6';
+    const { context: skillContext } = loadSkillContextForDirect(skill, skillsRoot);
+
+    // 多组模式：给模型明确的方向清单与输出模板，一次性产出 N 组
+    const variantBlock = isMultiVariant
+      ? `\n\n本次需要一次性输出 ${variantTotal} 组提示词。共享同一核心创意与主体身份，但每组使用不同的镜头/视角/调度方向：\n${
+          variantDirections.slice(0, variantTotal).map((d, i) => `第${i + 1}组 · ${d.label}：${d.hint}`).join('\n')
+        }\n\n输出格式（严格遵守）：\n每组以一行 \`===第N组 · 方向标签===\` 开头，紧跟换行后写完整提示词正文。组与组之间用空行分隔。示例：\n===第1组 · ${variantDirections[0]?.label || ''}===\n生成一段${duration}、${aspectRatio}、2K、原生立体声。\n（时间线 / 剪辑与动作 / 视觉风格 / 声音设计 四段完整内容）\n\n===第2组 · ${variantDirections[1]?.label || ''}===\n生成一段${duration}、${aspectRatio}、2K、原生立体声。\n（同上四段）\n\n以此类推，共输出 ${variantTotal} 组，每组方向严格对应上面的清单。`
+      : '';
+
+    const systemPrompt = `你是 MiniMax-H3 (海螺 AI) 视频提示词工程师。请直接根据用户的核心创意，推理出${isMultiVariant ? ` ${variantTotal} 条` : '一条'}结构完整、可直接复制使用的中文视频提示词。
+
+关键约束：
+- 视频时长：${duration}
+- 画幅：${aspectRatio}
+- 视觉风格倾向：${options.skillTitle || skill?.title || '通用电影感'}
+- ${dialogueHint}${variantBlock}${skillContext ? `\n\n以下是所选 Skill「${skill?.title || ''}」的完整写作规则与参考文件，必须严格遵循其输出格式、段落结构与风格要求：\n${skillContext}` : ''}
+
+每组提示词内部要求：
+1. 第一行以"生成一段${duration}、${aspectRatio}、2K、原生立体声。"开头，然后空一行。
+2. 按"时间线 / 剪辑与动作 / 视觉风格 / 声音设计"四段输出，时间段无缺口覆盖 0—${durationSeconds} 秒。
+3. 对白、旁白、歌词必须写在"时间线"段对应时段内（用中文双引号包裹），不得出现在"声音设计"段。
+4. 全文使用中文正向可见描述；不使用 8K render、ultra-detailed 等图像式渲染关键词。
+5. 结尾保留 0.4—1.2 秒呈现完整结果或情绪余波。
+6. 不要输出 JSON、不要输出标题、不要输出解释或候选方案。
+
+直接${isMultiVariant ? `按上述 ${variantTotal} 组格式` : ''}输出，不要任何前后缀说明。`;
+
+    const completionParams: any = {
+      model,
+      messages: [
+        { role: 'system', content: systemPrompt },
+        { role: 'user', content: userPrompt },
+      ],
+      temperature: 0.7,
+      stream: true,
+      // 每组约 4K tokens；多组时按组数放大，避免 10 组被 16K 截断只剩 1 组
+      max_tokens: Math.min(65536, Math.max(16384, variantTotal * 4096)),
+    };
+    if (options.thinkingEnabled !== false) {
+      completionParams.thinking = { type: 'enabled' };
+      completionParams.reasoning_effort = options.reasoningEffort || 'medium';
+    }
+
+    let content = '';
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      try {
+        const stream = await client.chat.completions.create(completionParams, { signal });
+        for await (const chunk of stream as any) {
+          const delta = chunk.choices?.[0]?.delta;
+          if (delta?.reasoning_content) onDelta?.(delta.reasoning_content, 'reasoning');
+          if (delta?.content) {
+            content += delta.content;
+            onDelta?.(delta.content, 'content');
+          }
+        }
+        break;
+      } catch (error: any) {
+        if (isAbortError(error, signal)) throw error;
+        if (adjustMaxTokens(error, completionParams)) continue;
+        // 直接推理模式：降级思考/重试一次
+        if (completionParams.reasoning_effort && /unsupported|not supported|不支持/i.test(String(error?.message || ''))) {
+          delete completionParams.reasoning_effort;
+          onCompatibility?.('当前模型不支持思考强度，已保留思考模式。');
+          continue;
+        }
+        if (completionParams.thinking && /thinking/i.test(String(error?.message || ''))) {
+          delete completionParams.thinking;
+          delete completionParams.reasoning_effort;
+          onCompatibility?.('当前模型不支持思考模式，已自动关闭。');
+          continue;
+        }
+        throw error;
+      }
+    }
+    if (!content.trim()) throw new Error('直接推理模式未返回有效内容。');
+
+    // 构造单组 StructuredPromptOutput 的辅助函数
+    const buildVariant = (text: string, index: number, direction?: { label: string; hint: string }): StructuredPromptOutput => ({
+      title: `直接推理 · ${options.duration || '6s'}${direction ? ` · ${direction.label}` : ''}`,
+      englishPrompt: text.trim(),
+      chineseTranslation: text.trim(),
+      subjectDescription: text.slice(0, 200),
+      cameraMovement: '由模型直接推理决定',
+      lightingAndAtmosphere: '由模型直接推理决定',
+      styleAndAesthetics: options.skillTitle || '直接推理',
+      negativePrompt: '',
+      soundCue: '',
+      technicalParams: {
+        targetModel: options.targetModel || 'minimax-h3',
+        aspectRatio: options.aspectRatio || '16:9',
+        fps: 24,
+        duration: options.duration || '6s',
+        motionSpeed: options.motionSpeed || 7,
+      },
+      variantIndex: index > 0 ? index + 1 : undefined,
+      variantDirection: direction?.label,
+    });
+
+    // 多组模式：按组分隔符拆分（兼容 ===第N组=== / ## 第N组 / 【第N组】/ 第N组： 等常见格式）
+    if (isMultiVariant) {
+      const separatorRe = /^[\s#*=【】（）()*~_-]*第\s*\d+\s*组[^\n]*$/m;
+      const segments = content.split(separatorRe).map((s) => s.trim()).filter(Boolean);
+      // 模型可能没用分隔符 → 降级为单组，避免 5 组只剩 1 组时空白
+      if (segments.length < variantTotal) {
+        onCompatibility?.(`模型仅返回 ${segments.length} 组（期望 ${variantTotal}），已按实际返回展示。`);
+      }
+      return segments.slice(0, variantTotal).map((seg, i) =>
+        buildVariant(seg, i, variantDirections[i]),
+      );
+    }
+
+    return [buildVariant(content.trim(), 0)];
+  };
+
+  // 多组生成方向标签（仅作为系统提示词中的差异化提示，不强制对齐）
+  const VARIANT_DIRECTIONS = [
+    { label: '远景为主，慢推镜头', hint: '本组以远景/大全景为主，采用慢速推进镜头，强调环境氛围与人物渺小感' },
+    { label: '中景为主，横移镜头', hint: '本组以中景为主，采用横向平移镜头，强调人物动作与空间关系' },
+    { label: '特写为主，跟随镜头', hint: '本组以近景/特写为主，采用跟随镜头，强调表情、材质与细节' },
+    { label: '俯视构图，缓慢上升', hint: '本组以俯视构图为主，镜头缓慢上升，强调几何与图案' },
+    { label: '仰视构图，环绕弧线', hint: '本组以仰视构图为主，镜头环绕弧线运动，强调庄严与力量' },
+  ];
+
   const isAbortError = (error: any, signal?: AbortSignal) =>
     signal?.aborted || error?.name === 'AbortError' || error?.code === 'ABORT_ERR';
 
@@ -1023,6 +1227,8 @@ export async function startServer(options: StartServerOptions = {}): Promise<Sta
         userApiKey,
         baseUrl: userBaseUrl,
         customBaseUrl,
+        variantCount = 1,
+        generationMode = 'preset',
       } = req.body || {};
 
       const allowedFormats = new Set<ImagePromptFormat>(['generic', 'midjourney', 'flux', 'sdxl', 'jimeng', 'doubao']);
@@ -1044,7 +1250,13 @@ export async function startServer(options: StartServerOptions = {}): Promise<Sta
       if (!apiKey) throw new Error('图片提示词生成需要配置可用的 API Key。');
       const baseUrl = formatBaseUrl(userBaseUrl || customBaseUrl || process.env.DEEPSEEK_BASE_URL);
       const client = new OpenAI({ baseURL: baseUrl, apiKey });
-      const systemPrompt = buildImagePromptSystemPrompt({ skill, format, aspectRatio, styleCodes });
+      // 用户文本明确要求组数时优先于 UI 设置
+      const resolvedCount = resolveEffectiveVariantCount(Number(variantCount), prompt);
+      const variantTotal = resolvedCount.count;
+      if (resolvedCount.userOverride) {
+        send('stage', { stage: 'compatibility', message: `检测到提示词明确要求 ${variantTotal} 组，已覆盖界面中的 ${Number(variantCount) || 1} 组设置。` });
+      }
+      const useDirectMode = generationMode === 'direct';
       const reasoning: ReasoningUsage = {
         requested: thinkingEnabled,
         applied: thinkingEnabled,
@@ -1052,7 +1264,49 @@ export async function startServer(options: StartServerOptions = {}): Promise<Sta
       };
 
       send('stage', { stage: 'prepare', message: `正在加载 ${skill.title}...` });
-      send('stage', { stage: 'generate', message: `正在生成 ${format} 图片提示词...` });
+
+      // 直接推理模式：简化系统提示词，跳过 JSON modules 解析
+      // 预设模式：走 Skill 工作流（JSON modules → 格式转换）；多组时要求模型返回 JSON 数组，每组一个完整模块对象
+      const formatSpecificRule = (() => {
+        switch (format) {
+          case 'midjourney': return `自然语言描述后追加参数，必须包含 "--ar ${aspectRatio}"。`;
+          case 'flux': return `输出完整的英文自然语言画面描述，不加任何参数。`;
+          case 'sdxl': return `第一行正向提示词，第二行以 "Negative:" 开头写负面词。`;
+          case 'jimeng':
+          case 'doubao': return `输出中文自然语言画面描述。`;
+          default: return `输出中文模块化图片提示词，按"画面类型/景别/构图/主体/动作/环境/光影/美学"组织。`;
+        }
+      })();
+      const presetMultiVariantRule = !useDirectMode && variantTotal > 1
+        ? `\n\n本次需要一次性输出 ${variantTotal} 组提示词。共享同一核心创意与主体身份，但每组使用不同的构图/景别/光影方向。\n严格输出 JSON 数组，包含 ${variantTotal} 个对象，每个对象必须包含且仅包含以下键：\ntitle（本组标题）、modules（完整模块对象，键为 imageType、shotAndAngle、composition、subject、actionAndExpression、spatialStaging、environment、lightingAndColor、aestheticsAndMaterials、aspectAndQuality）、negativeConcepts（负面概念数组）。不要输出任何其他文字或代码块标记。`
+        : '';
+      const variantBlockText = variantTotal > 1
+        ? `\n\n本次需要一次性输出 ${variantTotal} 组提示词。共享同一核心创意与主体身份，但每组使用不同的构图/景别/光影方向：\n${
+            VARIANT_DIRECTIONS.slice(0, variantTotal).map((d, i) => `第${i + 1}组 · ${d.label}：${d.hint}`).join('\n')
+          }\n\n输出格式：\n每组以一行 \`===第N组 · 方向标签===\` 开头，紧跟换行后写完整提示词正文。组与组之间用空行分隔。共输出 ${variantTotal} 组。`
+        : '';
+      const multiVariantRule = useDirectMode ? variantBlockText : presetMultiVariantRule;
+
+      const directSystemPrompt = `你是图片提示词工程师。请根据用户的核心创意，直接${variantTotal > 1 ? `输出 ${variantTotal} 条` : '输出一条'}${format} 格式的图片提示词。
+
+关键约束：
+- 画幅：${aspectRatio}
+- 视觉风格：${skill.title}
+- 画风代码：${styleCodes || '未指定，按画面意图选择克制默认值'}${multiVariantRule}
+
+输出要求：
+1. 直接输出提示词正文，不要 JSON、不要标题、不要解释。
+2. ${formatSpecificRule}
+3. 全文使用正向可见描述；不使用 8K render、ultra-detailed 等图像式渲染关键词。
+
+直接${variantTotal > 1 ? `按上述 ${variantTotal} 组格式` : ''}输出，不要任何前后缀说明。`;
+
+      const presetSystemPrompt = variantTotal > 1
+        ? `${buildImagePromptSystemPrompt({ skill, format, aspectRatio, styleCodes })}\n\n${presetMultiVariantRule}`
+        : buildImagePromptSystemPrompt({ skill, format, aspectRatio, styleCodes });
+      const systemPrompt = useDirectMode ? directSystemPrompt : presetSystemPrompt;
+
+      send('stage', { stage: 'generate', message: `正在生成 ${format} 图片提示词${variantTotal > 1 ? `（${variantTotal} 组）` : ''}...` });
 
       const completionParams: any = {
         model,
@@ -1062,7 +1316,7 @@ export async function startServer(options: StartServerOptions = {}): Promise<Sta
         ],
         temperature,
         stream: true,
-        max_tokens: 32768,
+        max_tokens: 16384,
       };
       if (thinkingEnabled) {
         completionParams.thinking = { type: 'enabled' };
@@ -1116,16 +1370,84 @@ export async function startServer(options: StartServerOptions = {}): Promise<Sta
       }
       if (!rawContent) throw new Error('图片提示词模型未返回有效内容。');
 
-      send('stage', { stage: 'validate', message: '正在校验画面结构并转换目标格式...' });
-      const canonical = parseImagePromptCanonical(rawContent);
-      const target = formatImagePrompt(canonical, format, aspectRatio);
+      // 构造单组结果（直接推理 vs 预设模式分流）
+      const buildSingleResult = (text: string, index: number, direction?: { label: string }) => {
+        if (useDirectMode) {
+          // 直接推理：target.prompt 直接是模型输出文本，canonical 用占位
+          return {
+            matchedSkill: skill.id,
+            canonical: {
+              title: `${skill.title}${direction ? ` · ${direction.label}` : ''}`,
+              modules: {
+                imageType: '', shotAndAngle: '', composition: '', subject: '',
+                actionAndExpression: '', spatialStaging: '', environment: '',
+                lightingAndColor: '', aestheticsAndMaterials: '', aspectAndQuality: '',
+              },
+            },
+            target: {
+              format,
+              prompt: text.trim(),
+              aspectRatio,
+              parameters: { aspectRatio },
+            },
+            reasoning,
+            model,
+            variantIndex: index > 0 ? index + 1 : undefined,
+            variantDirection: direction?.label,
+          };
+        }
+        // 预设模式：JSON 解析 + 格式转换
+        const canonical = parseImagePromptCanonical(text);
+        const target = formatImagePrompt(canonical, format, aspectRatio);
+        return {
+          matchedSkill: skill.id,
+          canonical,
+          target,
+          reasoning,
+          model,
+          variantIndex: index > 0 ? index + 1 : undefined,
+          variantDirection: direction?.label,
+        };
+      };
+
+      // 检测模型是否自行返回了 JSON 数组（用户在 prompt 里要求多组时常见，无视 UI 组数设置）
+      let arrayItems: string[] | null = null;
+      const trimmedRaw = rawContent.trim().replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/i, '');
+      if (trimmedRaw.startsWith('[')) {
+        try {
+          const arr = JSON.parse(trimmedRaw);
+          if (Array.isArray(arr) && arr.length > 1) arrayItems = arr.map((item) => JSON.stringify(item));
+        } catch { /* 非 JSON 数组，走下方常规流程 */ }
+      }
+
+      // 多组拆分：优先识别 JSON 数组 → 其次 ===第N组=== 分隔符 → 最后单组
+      let allResults: any[];
+      if (arrayItems && arrayItems.length > 1) {
+        send('stage', { stage: 'validate', message: `检测到模型返回 ${arrayItems.length} 组图片提示词，正在拆分...` });
+        allResults = arrayItems.map((item, i) => buildSingleResult(item, i));
+      } else if (variantTotal > 1) {
+        send('stage', { stage: 'validate', message: `正在拆分 ${variantTotal} 组图片提示词...` });
+        const separatorRe = /^===第\d+组[^=\n]*===\s*$/m;
+        const segments = rawContent.split(separatorRe).map((s) => s.trim()).filter(Boolean);
+        if (segments.length < variantTotal) {
+          send('stage', { stage: 'compatibility', message: `模型仅返回 ${segments.length} 组（期望 ${variantTotal}），已按实际返回展示。` });
+        }
+        allResults = segments.slice(0, variantTotal).map((seg, i) =>
+          buildSingleResult(seg, i, VARIANT_DIRECTIONS[i]),
+        );
+      } else {
+        send('stage', { stage: 'validate', message: '正在校验画面结构并转换目标格式...' });
+        allResults = [buildSingleResult(rawContent, 0)];
+      }
+
+      // 组装最终结果：第一组挂顶层，其余挂 variants（按实际拆出的组数，而非 UI 组数）
+      const firstResult = allResults[0];
       const finalData = {
         success: true,
-        matchedSkill: skill.id,
-        canonical,
-        target,
-        reasoning,
-        model,
+        ...firstResult,
+        variantIndex: undefined,
+        variantDirection: undefined,
+        variants: allResults.length > 1 ? allResults.slice(1) : undefined,
       };
       if (!res.writableEnded && !res.destroyed && !requestController.signal.aborted) {
         res.write(formatSseEvent({ event: 'final', data: finalData }));
@@ -1213,35 +1535,133 @@ export async function startServer(options: StartServerOptions = {}): Promise<Sta
           })
         : offlineAgentCall;
 
-      const agentResult = await runH3AgentGeneration({
-        userPrompt: roughUserPrompt,
-        skills: h3Skills,
-        skillsRoot: h3SkillsDir,
-        callLlm,
-        options: {
-          ...options,
-          skillId: options.skillId,
-          inputMode: options.inputMode || 'text',
-          sceneMode: options.sceneMode,
-        },
-        emit: (event) => {
-          if (event.type === 'turn_start') {
-            send('stage', { stage: event.stage || `turn_${event.turn}`, message: event.message || `Agent 推理第 ${event.turn} 轮...` });
-          } else if (event.type === 'tool_call') {
-            send('stage', { stage: `tool_${event.toolName}`, message: event.message || `调用工具 ${event.toolName}` });
-          } else if (event.type === 'tool_result' && event.toolName === 'validate_skill_output') {
-            send('stage', { stage: 'validate', message: event.message || (event.issues && event.issues.length ? `校验发现 ${event.issues.length} 个问题` : '校验通过') });
+      // 用户文本明确要求组数时优先于 UI 设置
+      const resolvedCount = resolveEffectiveVariantCount(Number(options.variantCount), roughUserPrompt);
+      const variantTotal = resolvedCount.count;
+      if (resolvedCount.userOverride) {
+        send('stage', { stage: 'compatibility', message: `检测到提示词明确要求 ${variantTotal} 组，已覆盖界面中的 ${Number(options.variantCount) || 1} 组设置。` });
+      }
+      const useDirectMode = options.generationMode === 'direct';
+      const variantDirections = variantTotal > 1 ? VARIANT_DIRECTIONS : [];
+
+      let allVariants: StructuredPromptOutput[] = [];
+
+      if (useDirectMode) {
+        // 直接推理模式：一次调用产出全部 N 组，后端按 ===第N组=== 拆分
+        if (!client) throw new Error('直接推理模式需要配置可用的 API Key。');
+        send('stage', { stage: 'direct', message: variantTotal > 1 ? `正在直接推理 ${variantTotal} 组（一次调用）...` : '正在直接推理...' });
+        allVariants = await runDirectPromptGeneration({
+          client,
+          model,
+          userPrompt: roughUserPrompt,
+          options: { ...options, thinkingEnabled, reasoningEffort },
+          skill: h3Skills.find((s) => s.id === options.skillId),
+          skillsRoot: h3SkillsDir,
+          variantTotal,
+          variantDirections,
+          onDelta: (text, kind) => send('delta', { text, kind }),
+          onCompatibility: (message) => send('stage', { stage: 'compatibility', message }),
+          signal: requestController.signal,
+        });
+      } else if (options.generationMode === 'agent') {
+        // Agent 自主推理：多轮工具循环（只读 Skill 资料），输出宽松，不卡格式校验
+        if (!client) throw new Error('Agent 推理模式需要配置可用的 API Key。');
+        const selectedSkill = h3Skills.find((s) => s.id === options.skillId);
+        if (!selectedSkill) throw new Error(`未找到所选 Skill：${options.skillId}`);
+        send('stage', { stage: 'agent', message: variantTotal > 1 ? `Agent 自主推理 ${variantTotal} 组（读资料 → 输出）...` : 'Agent 自主推理中（自主读取 Skill 资料）...' });
+        const freeResult = await runFreeformAgentLoop({
+          userPrompt: roughUserPrompt,
+          skill: selectedSkill,
+          skillsRoot: h3SkillsDir,
+          callLlm,
+          variantTotal,
+          variantDirections,
+          options: {
+            duration: options.duration,
+            aspectRatio: options.aspectRatio,
+            targetModel: options.targetModel,
+            motionSpeed: options.motionSpeed,
+            skillTitle: selectedSkill.title,
+          },
+          emit: (event) => {
+            if (event.type === 'turn_start') {
+              send('stage', { stage: event.stage || `turn_${event.turn}`, message: event.message || `Agent 推理第 ${event.turn} 轮...` });
+            } else if (event.type === 'tool_call') {
+              send('stage', { stage: `tool_${event.toolName}`, message: event.message || `调用工具 ${event.toolName}` });
+            }
+          },
+          onCompatibility: (message) => send('stage', { stage: 'compatibility', message }),
+          signal: requestController.signal,
+        });
+        allVariants = freeResult.variants;
+      } else {
+        // 预设模式（Agent 状态机）：仍按组循环（Agent 协议要求一次提交一个结果）
+        for (let i = 0; i < variantTotal; i += 1) {
+          const direction = variantTotal > 1 ? VARIANT_DIRECTIONS[i % VARIANT_DIRECTIONS.length] : null;
+          const variantHint = direction ? `\n本组差异化方向（第 ${i + 1}/${variantTotal} 组）：${direction.hint}。` : '';
+          if (variantTotal > 1) send('stage', { stage: `variant_${i + 1}`, message: `正在生成第 ${i + 1}/${variantTotal} 组...` });
+
+          const agentResult = await runH3AgentGeneration({
+            userPrompt: roughUserPrompt + variantHint,
+            skills: h3Skills,
+            skillsRoot: h3SkillsDir,
+            callLlm,
+            options: {
+              ...options,
+              skillId: options.skillId,
+              inputMode: options.inputMode || 'text',
+              sceneMode: options.sceneMode,
+              variantCount: variantTotal,
+            },
+            emit: (event) => {
+              if (event.type === 'turn_start') {
+                send('stage', { stage: event.stage || `turn_${event.turn}`, message: variantTotal > 1 ? `[第 ${i + 1} 组] ${event.message || ''}` : (event.message || `Agent 推理第 ${event.turn} 轮...`) });
+              } else if (event.type === 'tool_call') {
+                send('stage', { stage: `tool_${event.toolName}`, message: event.message || `调用工具 ${event.toolName}` });
+              } else if (event.type === 'tool_result' && event.toolName === 'validate_skill_output') {
+                send('stage', { stage: 'validate', message: event.message || (event.issues && event.issues.length ? `校验发现 ${event.issues.length} 个问题` : '校验通过') });
+              }
+            },
+            signal: requestController.signal,
+          });
+          const structured = agentResult.structuredOutput;
+          if (variantTotal > 1) {
+            structured.variantIndex = i + 1;
+            structured.variantDirection = direction?.label;
           }
-        },
-        signal: requestController.signal,
-      });
+          allVariants.push(structured);
+        }
+      }
+
+      // 组装最终结果：第一组作为顶层，其余挂在 variants 数组
+      const firstStructured = allVariants[0];
+      const finalStructured: StructuredPromptOutput = {
+        ...firstStructured,
+        variantIndex: undefined,
+        variantDirection: undefined,
+        variants: variantTotal > 1 ? allVariants.slice(1) : undefined,
+      };
+
+      // 多组模式下重用第一组的 thinkingProcess；直接推理模式无 thinking
+      const thinkingProcess = useDirectMode
+        ? `直接推理模式：一次调用产出${variantTotal > 1 ? ` ${variantTotal} 组` : ''}提示词${variantTotal > 1 ? '（按 ===第N组=== 分隔符拆分）' : ''}。`
+        : `已通过 Skill Agent 状态机生成${variantTotal > 1 ? ` ${variantTotal} 组` : ''}提示词。`;
 
       send('final', {
         success: true,
-        ...agentResult,
+        matchedSkill: options.skillId,
+        confidence: useDirectMode ? 'medium' : 'high',
+        reason: useDirectMode
+          ? '直接推理模式：跳过 Skill Agent 状态机与校验'
+          : '通过所选 Skill 的工作流生成',
+        suggestedDirections: [],
+        variants: [],
+        review: { isValidH3Format: true, issues: [], fixedInRepairTurn: false },
+        structuredOutput: finalStructured,
+        thinkingProcess,
         reasoning: h3Reasoning,
         model: apiKey ? model : `${model} (内置 H3 Agent Runtime)`,
-        content: JSON.stringify(agentResult.structuredOutput, null, 2),
+        content: JSON.stringify(finalStructured, null, 2),
       });
       res.end();
     } catch (err: any) {

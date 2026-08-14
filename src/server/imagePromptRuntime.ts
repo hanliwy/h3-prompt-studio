@@ -70,29 +70,52 @@ export function formatImagePrompt(
   }
 }
 
+function fallbackCanonical(rawText: string): ImagePromptCanonical {
+  // 解析失败或格式不符时，把原始文本塞进 subject 字段，其余留空，保证结果能展示
+  const text = rawText.trim();
+  const emptyModules: ImagePromptModules = {
+    imageType: '', shotAndAngle: '', composition: '', subject: text,
+    actionAndExpression: '', spatialStaging: '', environment: '',
+    lightingAndColor: '', aestheticsAndMaterials: '', aspectAndQuality: '',
+  };
+  return { title: '图片提示词（原始输出）', modules: emptyModules };
+}
+
 export function parseImagePromptCanonical(content: string): ImagePromptCanonical {
   const normalized = content.trim().replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/i, '');
   let parsed: unknown;
   try {
     parsed = JSON.parse(normalized);
   } catch {
-    throw new Error('图片提示词模型返回的 JSON 无法解析');
+    // JSON 解析失败：降级为原始文本展示，不阻断
+    return fallbackCanonical(normalized);
   }
 
-  if (!parsed || typeof parsed !== 'object') throw new Error('图片提示词模型未返回对象');
+  // 模型可能返回数组（用户要求多组时）：取第一个元素
+  if (Array.isArray(parsed)) {
+    parsed = parsed[0];
+  }
+
+  if (!parsed || typeof parsed !== 'object') return fallbackCanonical(normalized);
   const candidate = parsed as Partial<ImagePromptCanonical>;
+
+  // 缺 title 或 modules：降级但不抛错
   if (!candidate.title || !candidate.modules || typeof candidate.modules !== 'object') {
-    throw new Error('图片提示词模型返回缺少 title 或 modules');
+    return fallbackCanonical(normalized);
   }
-  for (const [key] of MODULE_ORDER) {
-    if (!candidate.modules[key] || typeof candidate.modules[key] !== 'string') {
-      throw new Error(`图片提示词模型返回缺少 modules.${key}`);
-    }
-  }
-  if (candidate.negativeConcepts && !Array.isArray(candidate.negativeConcepts)) {
-    throw new Error('图片提示词模型返回的 negativeConcepts 必须是数组');
-  }
-  return candidate as ImagePromptCanonical;
+
+  // 缺字段用空字符串补齐，不抛错
+  const filledModules: ImagePromptModules = MODULE_ORDER.reduce((acc, [key]) => {
+    const val = candidate.modules![key];
+    acc[key] = typeof val === 'string' ? val : '';
+    return acc;
+  }, {} as ImagePromptModules);
+
+  return {
+    title: candidate.title,
+    modules: filledModules,
+    negativeConcepts: Array.isArray(candidate.negativeConcepts) ? candidate.negativeConcepts : undefined,
+  };
 }
 
 interface BuildImagePromptArgs {

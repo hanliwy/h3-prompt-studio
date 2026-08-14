@@ -2,12 +2,14 @@ import fs from 'fs';
 import path from 'path';
 import type {
 	AspectRatio,
+	DialogueMode,
 	H3AgentResult,
 	H3AgentReview,
 	H3InputMode,
 	H3ManualAuxiliaryParams,
 	H3PromptVariant,
 	H3SceneMode,
+	PromptGenerationMode,
 	StructuredPromptOutput,
 } from '../types';
 import type { H3SkillDefinition } from './h3SkillRuntime';
@@ -83,6 +85,8 @@ export interface H3AgentLoopRunOptions {
 	inputMode?: H3InputMode;
 	sceneMode?: H3SceneMode;
 	variantCount?: number;
+	dialogueMode?: DialogueMode;
+	generationMode?: PromptGenerationMode;
 }
 
 export interface AgentLoopOptions {
@@ -278,7 +282,25 @@ function executeTool(name: string, args: Record<string, unknown>, ctx: ToolConte
 function buildSystemPrompt(skill: H3SkillDefinition, config: H3SkillWorkflowConfig, options: H3AgentLoopRunOptions) {
 	const duration = config.fixedDuration || options.duration || skill.recommendedParams.duration;
 	const aspectRatio = config.fixedAspectRatio || options.aspectRatio || '16:9';
-	return `你是运行在服务器上的 MiniMax-H3 Skill 执行 Agent。前端已经选择唯一 Skill，不做路由，不生成候选，不等待用户批准。
+	const dialogueBlock = (() => {
+		switch (options.dialogueMode) {
+			case 'dialogue':
+				return '\n对白模式：人物必须在画面中实际开口说话，台词用中文双引号 "…" 包裹写入对应时段的画面/时间线段（不得放进声音段）。若用户未提供具体台词，按画面意图补全一句自然对白。';
+			case 'voiceover':
+				return '\n旁白模式：使用画外音 voiceover，台词用中文双引号 "…" 包裹写入画面/时间线段，并明确说明"画面中人物嘴唇保持完全闭合"。台词不得放进声音段。';
+			case 'lyrics':
+				return '\n歌词演唱模式：人物必须在画面中实际唱歌，歌词用中文双引号 "…" 包裹写入画面/时间线段；多个角色合唱时合并说话者描述。歌词不得放进声音段。';
+			case 'no-human-voice':
+				return '\n无任何人声模式：全文不得出现任何对白、旁白、歌词或人声演唱；声音段只描述环境声、动作声与配乐。';
+			case 'auto':
+			default:
+				return '\n对白模式：自动判断。若用户原话或画面意图暗示人物说话，按对白规则写入画面段；否则保留为纯环境声。';
+		}
+	})();
+	const variantBlock = (options.variantCount && options.variantCount > 1)
+		? `\n本次需要生成 ${options.variantCount} 组差异化提示词。每组保持核心创意与主体身份一致，但使用不同的镜头组合、视角、调度与节奏方向（例如：组1 远景慢推/组2 中景横移/组3 特写跟随）。每组都必须独立通过 Skill 专属校验。`
+		: '';
+	return `你是运行在服务器上的 MiniMax-H3 Skill 执行 Agent。前端已经选择唯一 Skill，不等待用户批准。${dialogueBlock}${variantBlock}
 
 已锁定：Skill=${skill.id}；inputMode=${options.inputMode || 'text'}；sceneMode=${options.sceneMode || '不适用'}；duration=${duration}；aspectRatio=${aspectRatio}；targetModel=${options.targetModel || 'minimax-h3'}；camera=${options.cameraMotionLabel || '按 Skill 规划'}；lens=${options.lensLabel || '按 Skill 规划'}；lighting=${options.lightingLabel || '按 Skill 规划'}。
 
@@ -429,7 +451,10 @@ export async function runH3AgentLoop({
 	const finalResult = normalizeResult(submitted.result, selectedSkill, userPrompt);
 	const review = reviewResult(finalResult, selectedSkill, { ...options, inputMode, duration });
 	review.fixedInRepairTurn = sawValidationFailure && review.isValidH3Format;
-	if (!review.isValidH3Format) throw new Error(`最终结果未通过 ${selectedSkill.title} 专属校验：${review.issues.join('；')}`);
+	// 校验失败不阻断：结果已生成就展示，仅把 issues 作为格式提醒返回给前端
+	if (!review.isValidH3Format) {
+		trace.push(`结果已生成，但存在 ${review.issues.length} 个格式提醒：${review.issues.join('；')}`);
+	}
 
 	trace.push(`读取文件：${Array.from(context.readFiles).join('、')}`);
 	trace.push(`锁定计划：${context.plan?.timelineSegments.length || 0} 个时间段/节拍`);

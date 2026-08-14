@@ -67,8 +67,29 @@ const H3_SKILL_MANIFEST = [
       duration: '15s',
     },
     tags: ['官方格式', 'T2VA', 'I2VA', 'Ref2VA', '声音字段'],
-    aliases: ['general_master', 'cinematic_imax', 'cyberpunk_scifi', 'character_dynamics', 'macro_nature'],
+    aliases: ['cinematic_imax', 'cyberpunk_scifi', 'character_dynamics', 'macro_nature'],
     routingKeywords: ['通用', 'prompt', '提示词', '镜头', '运镜', '海螺', 'minimax', 'h3'],
+  },
+  {
+    id: 'h3-general-six-section',
+    folder: 'h3-general-six-section',
+    title: '通用六段式全能简写',
+    titleEn: 'H3 General Six-Section',
+    category: '官方基础',
+    icon: 'Sparkles',
+    description:
+      '官方全参考模式六段式（主体定义/任务概述/保留分析/画面描述/环境声/配乐）的中文精简版，结构完整、长度可控，适合没有参考素材的快速文生视频。',
+    sampleInput: '雨夜城市中，一个人撑伞走过霓虹街口，水面倒影随着脚步轻微晃动',
+    recommendedParams: {
+      cameraMotion: 'tracking_shot' as CameraMotion,
+      lens: '35mm_anamorphic' as LensType,
+      lighting: 'sunlit_natural' as LightingStyle,
+      fps: 24,
+      duration: '10s',
+    },
+    tags: ['通用预设', '六段式', '全能简写', '中文成品'],
+    aliases: ['general_master'],
+    routingKeywords: ['通用', '六段式', '全能', '简写', 'general'],
   },
   {
     id: 'minimalist-product-ad-generator',
@@ -377,20 +398,90 @@ function readSkillInstruction(skillDir: string): { instruction: string; sourceFi
   };
 }
 
-export function loadH3SkillDefinitions(skillsRoot: string): H3SkillDefinition[] {
-  return H3_SKILL_MANIFEST.map((manifest) => {
-    const skillDir = path.join(skillsRoot, manifest.folder);
-    const { instruction, sourceFiles } = readSkillInstruction(skillDir);
-    const workflow = getH3SkillWorkflowConfig(manifest.id);
+// 从 meta.yaml 提取展示字段（不依赖 yaml 库，只取顶层 key:value 和一个列表）
+function readSkillMeta(skillDir: string): {
+  displayNameZh?: string;
+  tagEn?: string;
+  tagCn?: string;
+  summaryCn?: string;
+  completeTagsCn?: string[];
+} {
+  const metaPath = path.join(skillDir, 'meta.yaml');
+  if (!fs.existsSync(metaPath)) return {};
+  const raw = readTextFile(metaPath) || '';
+  const get = (key: string) => {
+    const m = raw.match(new RegExp(`^${key}:\\s*(.+)$`, 'm'));
+    return m ? m[1].trim().replace(/^["']|["']$/g, '') : undefined;
+  };
+  const listMatch = raw.match(/^complete-tags-cn:\s*\n((?:-\s+.+\n?)+)/m);
+  const completeTagsCn = listMatch
+    ? listMatch[1].split('\n').map((l) => l.replace(/^-\s+/, '').trim()).filter(Boolean)
+    : undefined;
+  return {
+    displayNameZh: get('display-name-zh'),
+    tagEn: get('tag-en'),
+    tagCn: get('tag-cn'),
+    summaryCn: get('summary-cn'),
+    completeTagsCn,
+  };
+}
 
-    return {
-      ...manifest,
+export function loadH3SkillDefinitions(skillsRoot: string): H3SkillDefinition[] {
+  if (!fs.existsSync(skillsRoot)) return [];
+  const knownByFolder = new Map(H3_SKILL_MANIFEST.map((m) => [m.folder, m]));
+  const folders = fs
+    .readdirSync(skillsRoot, { withFileTypes: true })
+    .filter((e) => e.isDirectory())
+    .map((e) => e.name);
+
+  const skills: H3SkillDefinition[] = [];
+  for (const folder of folders) {
+    const skillDir = path.join(skillsRoot, folder);
+    const { instruction, sourceFiles } = readSkillInstruction(skillDir);
+    const manifest = knownByFolder.get(folder);
+
+    if (manifest) {
+      const workflow = getH3SkillWorkflowConfig(manifest.id);
+      skills.push({
+        ...manifest,
+        ...workflow,
+        systemPrompt: instruction || `${manifest.titleEn}: ${manifest.description}`,
+        instruction: instruction || `${manifest.titleEn}: ${manifest.description}`,
+        sourceFiles,
+      });
+      continue;
+    }
+
+    // 新拷贝的 Skill（不在清单内）：自动识别；读不到任何说明文件则跳过
+    if (!instruction) continue;
+    const meta = readSkillMeta(skillDir);
+    const workflow = getH3SkillWorkflowConfig(folder);
+    skills.push({
+      id: folder,
+      folder,
+      title: meta.displayNameZh || folder,
+      titleEn: meta.tagEn || folder,
+      category: meta.tagCn || '自定义',
+      icon: 'Sparkles',
+      description: meta.summaryCn || `自定义 Skill：${folder}`,
+      sampleInput: '',
+      recommendedParams: {
+        cameraMotion: 'tracking_shot' as CameraMotion,
+        lens: '35mm_anamorphic' as LensType,
+        lighting: 'sunlit_natural' as LightingStyle,
+        fps: 24,
+        duration: '6s',
+      },
+      tags: meta.completeTagsCn?.length ? meta.completeTagsCn : ['自定义'],
+      aliases: [],
+      routingKeywords: [],
       ...workflow,
-      systemPrompt: instruction || `${manifest.titleEn}: ${manifest.description}`,
-      instruction: instruction || `${manifest.titleEn}: ${manifest.description}`,
+      systemPrompt: instruction,
+      instruction,
       sourceFiles,
-    };
-  });
+    });
+  }
+  return skills;
 }
 
 export function resolveH3SkillById(
