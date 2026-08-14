@@ -38,7 +38,10 @@ assert.ok(formatImagePrompt(canonical, 'jimeng', '16:9').prompt.includes('【画
 
 const parsed = parseImagePromptCanonical(`\n\`\`\`json\n${JSON.stringify(canonical)}\n\`\`\`\n`);
 assert.equal(parsed.title, canonical.title);
-assert.throws(() => parseImagePromptCanonical('{"title":"缺少模块"}'), /modules/);
+// 容错：格式不符时降级为 fallback canonical（不抛错），原始文本保留在 subject 字段
+const degraded = parseImagePromptCanonical('{"title":"缺少模块"}');
+assert.ok(degraded.modules.subject.includes('缺少模块'));
+assert.ok(degraded.title.includes('原始输出'));
 
 const skill: ImageSkillDefinition = {
   id: 'gaven-direct-image-prompts',

@@ -102,12 +102,20 @@ export function createH3OpenAiCall({
     const submitToolOnly = Array.isArray(tools)
       && tools.length === 1
       && tools[0].function.name === 'submit_generated_prompt';
+    // 参考 pi(packages/ai/src/api/simple-options.ts) 的 thinking budget：
+    // 按 effort 限定思考预算，避免 high + 384K 任由模型长时间思考拖慢响应
+    const THINKING_BUDGETS: Record<string, number> = { minimal: 1024, low: 2048, medium: 8192, high: 16384 };
+    const ANSWER_BUDGET = 16384;
+    const effortKey = reasoning?.applied ? String(reasoning.effort || 'medium') : '';
+    const thinkingBudget = effortKey ? (THINKING_BUDGETS[effortKey] ?? 8192) : 0;
+    const maxOutputTokens = thinkingBudget + ANSWER_BUDGET;
+
     const completionParams: Record<string, any> = {
       model,
       messages: [{ role: 'system', content: systemPrompt }, ...messages.map(toOpenAiMessage)],
       temperature,
       stream: true,
-      max_tokens: 393216,
+      max_tokens: maxOutputTokens,
     };
 
     if (Array.isArray(tools) && tools.length > 0) {

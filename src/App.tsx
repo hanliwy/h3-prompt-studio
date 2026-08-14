@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { Navbar } from './components/Navbar';
 import { PromptGenerator } from './components/PromptGenerator';
 import { SkillsVaultView } from './components/SkillsVaultView';
@@ -28,6 +28,7 @@ import { INITIAL_GALLERY_ITEMS } from './data/galleryData';
 import { MINIMAX_SKILLS } from './data/skills';
 
 export default function App() {
+  const historySaveQueueRef = useRef<Promise<void>>(Promise.resolve());
   const [activeTab, setActiveTab] = useState<'generator' | 'skills' | 'gallery' | 'history'>('generator');
 
   // DeepSeek Settings state
@@ -282,11 +283,22 @@ export default function App() {
 
   // History handlers
   const handleSaveToHistory = (item: PromptHistoryItem) => {
-    setHistoryItems((prev) => [item, ...prev]);
-    fetch('/api/history', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(item),
+    setHistoryItems((prev) => {
+      const existing = prev.find((entry) => entry.id === item.id);
+      if (!existing) return [item, ...prev];
+      return prev.map((entry) => (
+        entry.id === item.id
+          ? { ...entry, ...item, isFavorite: entry.isFavorite || item.isFavorite }
+          : entry
+      ));
+    });
+    historySaveQueueRef.current = historySaveQueueRef.current.then(async () => {
+      const response = await fetch('/api/history', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(item),
+      });
+      if (!response.ok) throw new Error(`History save failed: ${response.status}`);
     }).catch(() => {
       console.warn('API /api/history save failed, kept browser history only.');
     });

@@ -53,7 +53,9 @@ import {
   ImagePromptFormat,
   ImagePromptResult,
   ImageSkill,
-  ReasoningUsage
+  ReasoningUsage,
+  DialogueMode,
+  PromptGenerationMode
 } from '../types';
 
 // 图片反推快速切换渠道列表（与设置弹窗一致）
@@ -225,7 +227,14 @@ export const PromptGenerator: React.FC<PromptGeneratorProps> = ({
   const [selectedImageSkillId, setSelectedImageSkillId] = useState('gaven-direct-image-prompts');
   const [imagePromptFormat, setImagePromptFormat] = useState<ImagePromptFormat>('generic');
   const [imageResult, setImageResult] = useState<ImagePromptResult | null>(null);
-  const [imageAspectRatio, setImageAspectRatio] = useState<AspectRatio>('1:1');
+  // 多组图片结果时当前激活的那一组（单组时直接等于 imageResult）
+  const activeImageResult: ImagePromptResult | null = (() => {
+    if (!imageResult) return null;
+    if (!imageResult.variants || imageResult.variants.length === 0) return imageResult;
+    const variantList = [imageResult, ...imageResult.variants];
+    return variantList[activeVariantIndex] || imageResult;
+  })();
+  const [imageAspectRatio, setImageAspectRatio] = useState<AspectRatio>('9:16');
   const [imageDirectorStyle, setImageDirectorStyle] = useState('');
   const [imagePhotoStyle, setImagePhotoStyle] = useState('');
   const [imageCaptureFilm, setImageCaptureFilm] = useState('');
@@ -269,6 +278,15 @@ export const PromptGenerator: React.FC<PromptGeneratorProps> = ({
 
   const isGavenSkill = selectedSkill.id === 'gaven-cinematic-director';
 
+  // 视频人声处理模式：自动/对白/旁白/歌词演唱/无任何人声
+  const [dialogueMode, setDialogueMode] = useState<DialogueMode>('auto');
+  // 提示词组数：1 / 2 / 3 / 5
+  const [variantCount, setVariantCount] = useState<number>(1);
+  // 生成模式：preset=走 Skill Agent 状态机；direct=单轮 LLM 直接推理
+  const [generationMode, setGenerationMode] = useState<PromptGenerationMode>('direct');
+  // 多组结果当前激活的 tab 索引
+  const [activeVariantIndex, setActiveVariantIndex] = useState<number>(0);
+
   // Active channel & custom model overrides
   const [currentChannelId, setCurrentChannelId] = useState<string>(
     settings.activeProfileId || 'default-deepseek'
@@ -301,6 +319,13 @@ export const PromptGenerator: React.FC<PromptGeneratorProps> = ({
   } = currentRequestState;
   const isImageTaskGenerating = imageRequestState.isGenerating;
   const [structuredResult, setStructuredResult] = useState<StructuredPromptOutput | null>(null);
+  // 多组结果时当前激活的那一组（单组时直接等于 structuredResult）
+  const activeVariant: StructuredPromptOutput | null = (() => {
+    if (!structuredResult) return null;
+    if (!structuredResult.variants || structuredResult.variants.length === 0) return structuredResult;
+    const variantList = [structuredResult, ...structuredResult.variants];
+    return variantList[activeVariantIndex] || structuredResult;
+  })();
   const setIsLiveStreamOpen = (value: React.SetStateAction<boolean>) => {
     setCurrentRequestState((prev) => ({
       ...prev,
@@ -629,9 +654,70 @@ export const PromptGenerator: React.FC<PromptGeneratorProps> = ({
     if (!prompt || samples.has(prompt)) setUserQuery(skill.sampleInput);
   };
 
+  const buildHistoryDraftOutput = (
+    promptText: string,
+    title: string,
+    outputAspectRatio: AspectRatio,
+    outputTargetModel: VideoModelTarget,
+    outputDuration: string,
+  ): StructuredPromptOutput => ({
+    title,
+    englishPrompt: promptText,
+    chineseTranslation: promptText,
+    subjectDescription: promptText,
+    cameraMovement: '',
+    lightingAndAtmosphere: '',
+    styleAndAesthetics: '',
+    negativePrompt: '',
+    soundCue: '',
+    technicalParams: {
+      targetModel: outputTargetModel,
+      aspectRatio: outputAspectRatio,
+      fps: outputDuration === 'static' ? 0 : 24,
+      duration: outputDuration,
+      motionSpeed: outputDuration === 'static' ? 0 : motionSpeed,
+    },
+  });
+
   const handleGenerateImage = async (promptText: string) => {
+    const historyNow = new Date();
+    const historyBase = {
+      id: `hist-img-${historyNow.getTime()}`,
+      createdAt: historyNow.toLocaleString('zh-CN', { year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' }),
+      createdAtIso: historyNow.toISOString(),
+      historyDate: historyNow.toISOString().slice(0, 10),
+      userQuery: promptText,
+      skillId: selectedImageSkillId as StylePreset,
+      modelUsed: currentModelName || settings.model || 'deepseek-v4-flash',
+      isFavorite: false,
+    };
+    const imageDraftOutput = buildHistoryDraftOutput(
+      promptText,
+      '图片提示词 · 正在生成',
+      imageAspectRatio,
+      'midjourney',
+      'static',
+    );
+    const saveImageHistory = (
+      generationStatus: PromptHistoryItem['generationStatus'],
+      structuredOutput: StructuredPromptOutput,
+      errorMessage?: string,
+      modelUsed = historyBase.modelUsed,
+    ) => onSaveToHistory({
+      ...historyBase,
+      generationStatus,
+      errorMessage,
+      structuredOutput,
+      thinkingProcess: '',
+      modelUsed,
+    });
+
+    saveImageHistory('pending', imageDraftOutput);
+
     if (!selectedImageSkill) {
-      setImageRequestState((prev) => ({ ...prev, errorMessage: '图片 Skill 尚未加载，请确认后端服务已重启。' }));
+      const message = '图片 Skill 尚未加载，请确认后端服务已重启。';
+      saveImageHistory('error', { ...imageDraftOutput, title: '图片提示词 · 生成失败' }, message);
+      setImageRequestState((prev) => ({ ...prev, errorMessage: message }));
       return;
     }
     const generationController = replaceGenerationController(imageGenerationControllerRef);
@@ -645,10 +731,12 @@ export const PromptGenerator: React.FC<PromptGeneratorProps> = ({
       isLiveStreamOpen: true,
       shouldFollowLiveStream: true,
     }));
+    setActiveVariantIndex(0);
 
     const styleCodes = [imageDirectorStyle, imagePhotoStyle, imageCaptureFilm, imagePrintFilm, imageStyleIntensity]
       .filter(Boolean)
       .join('+');
+    let partialOutput = '';
 
     try {
       const res = await fetch('/api/image-prompt/generate-stream', {
@@ -666,6 +754,8 @@ export const PromptGenerator: React.FC<PromptGeneratorProps> = ({
           temperature: settings.temperature,
           thinkingEnabled: requestThinkingEnabled,
           reasoningEffort: requestReasoningEffort,
+          variantCount,
+          generationMode,
         }),
         signal: generationController.signal,
       });
@@ -689,6 +779,7 @@ export const PromptGenerator: React.FC<PromptGeneratorProps> = ({
           setImageRequestState((prev) => ({ ...prev, streamStage: data.stage || '', streamStatus: data.message || '' }));
         } else if (event === 'delta') {
           if (imageGenerationControllerRef.current !== generationController) return;
+          if ((data.kind || 'content') === 'content') partialOutput += data.text || '';
           setImageRequestState((prev) => ({
             ...prev,
             liveStreamSegments: [...prev.liveStreamSegments, { text: data.text || '', kind: data.kind || 'content' }].slice(-800),
@@ -720,15 +811,60 @@ export const PromptGenerator: React.FC<PromptGeneratorProps> = ({
         modelUsed: finalData.model,
         streamStatus: '完成',
       }));
+
+      // 把图片结果转成 StructuredPromptOutput 并存入历史记录（与视频模式共用历史）
+      const imageResultToStructured = (img: ImagePromptResult): StructuredPromptOutput => ({
+        title: img.canonical.title,
+        englishPrompt: img.target.prompt,
+        chineseTranslation: img.target.prompt,
+        subjectDescription: img.canonical.modules.subject,
+        cameraMovement: img.canonical.modules.shotAndAngle,
+        lightingAndAtmosphere: img.canonical.modules.lightingAndColor,
+        styleAndAesthetics: img.canonical.modules.aestheticsAndMaterials,
+        negativePrompt: img.target.negativePrompt || '',
+        soundCue: '',
+        technicalParams: {
+          targetModel: 'midjourney',
+          aspectRatio: img.target.aspectRatio,
+          fps: 0,
+          duration: 'static',
+          motionSpeed: 0,
+        },
+        variants: img.variants?.map((v, i) => {
+          const child = imageResultToStructured(v);
+          child.variantIndex = i + 2;
+          child.variantDirection = v.variantDirection;
+          return child;
+        }),
+      });
+      const imageHistoryItem: PromptHistoryItem = {
+        ...historyBase,
+        generationStatus: 'success',
+        structuredOutput: imageResultToStructured(finalData),
+        thinkingProcess: '',
+        modelUsed: finalData.model,
+      };
+      onSaveToHistory(imageHistoryItem);
     } catch (err: any) {
+      const interruptedOutput = partialOutput.trim()
+        ? {
+            ...imageDraftOutput,
+            title: '图片提示词 · 未完成',
+            englishPrompt: partialOutput.trim(),
+            chineseTranslation: partialOutput.trim(),
+          }
+        : imageDraftOutput;
       if (err?.name === 'AbortError') {
+        saveImageHistory('stopped', { ...interruptedOutput, title: '图片提示词 · 已停止' });
         if (imageGenerationControllerRef.current === generationController) {
           setImageRequestState((prev) => ({ ...prev, streamStage: 'stopped', streamStatus: '已停止生成' }));
         }
         return;
       }
       if (imageGenerationControllerRef.current === generationController) {
-        setImageRequestState((prev) => ({ ...prev, errorMessage: err?.message || '图片提示词生成失败' }));
+        const message = err?.message || '图片提示词生成失败';
+        saveImageHistory('error', { ...interruptedOutput, title: '图片提示词 · 生成失败' }, message);
+        setImageRequestState((prev) => ({ ...prev, errorMessage: message }));
       }
     } finally {
       if (imageGenerationControllerRef.current === generationController) {
@@ -745,12 +881,58 @@ export const PromptGenerator: React.FC<PromptGeneratorProps> = ({
       await handleGenerateImage(promptText);
       return;
     }
+
+    const historyNow = new Date();
+    const historyId = `hist-${historyNow.getTime()}`;
+    const pendingGavenStyleCodes = [directorStyle, photoStyle, captureFilm, printFilm, styleIntensity]
+      .filter(Boolean)
+      .join('+');
+    const historyBase = {
+      id: historyId,
+      createdAt: historyNow.toLocaleString('zh-CN', {
+        year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit',
+      }),
+      createdAtIso: historyNow.toISOString(),
+      historyDate: historyNow.toISOString().slice(0, 10),
+      userQuery: promptText,
+      skillId: selectedSkillId,
+      gavenStyleCodes: isGavenSkill ? pendingGavenStyleCodes || undefined : undefined,
+      modelUsed: currentModelName || settings.model || 'deepseek-v4-flash',
+      isFavorite: false,
+    };
+    const videoDraftOutput = buildHistoryDraftOutput(
+      promptText,
+      '视频提示词 · 正在生成',
+      aspectRatio,
+      targetModel || 'minimax-h3',
+      duration,
+    );
+    const saveVideoHistory = (
+      generationStatus: PromptHistoryItem['generationStatus'],
+      structuredOutput: StructuredPromptOutput,
+      errorMessage?: string,
+      extra: Partial<PromptHistoryItem> = {},
+    ) => onSaveToHistory({
+      ...historyBase,
+      generationStatus,
+      errorMessage,
+      structuredOutput,
+      thinkingProcess: '',
+      ...extra,
+    });
+
+    saveVideoHistory('pending', videoDraftOutput);
+
     if (inputMode === 'image' && referenceImages.length > 0 && !imageDescription) {
-      setVideoRequestState((prev) => ({ ...prev, errorMessage: '请先点击"反推核心内容提示词"，获取图片描述后再生成。' }));
+      const message = '请先点击"反推核心内容提示词"，获取图片描述后再生成。';
+      saveVideoHistory('error', { ...videoDraftOutput, title: '视频提示词 · 未开始' }, message);
+      setVideoRequestState((prev) => ({ ...prev, errorMessage: message }));
       return;
     }
     if (selectedSkill.requiresSceneMode && !sceneMode) {
-      setVideoRequestState((prev) => ({ ...prev, errorMessage: '当前 Skill 必须先选择文戏、武戏或九宫格模式。' }));
+      const message = '当前 Skill 必须先选择文戏、武戏或九宫格模式。';
+      saveVideoHistory('error', { ...videoDraftOutput, title: '视频提示词 · 未开始' }, message);
+      setVideoRequestState((prev) => ({ ...prev, errorMessage: message }));
       return;
     }
 
@@ -766,6 +948,7 @@ export const PromptGenerator: React.FC<PromptGeneratorProps> = ({
       isLiveStreamOpen: true,
       shouldFollowLiveStream: true,
     }));
+    setActiveVariantIndex(0);
 
     const cameraMotionLabel = CAMERA_MOTIONS.find((c) => c.value === cameraMotion)?.label;
     const lensLabel = LENS_TYPES.find((l) => l.value === lensType)?.label;
@@ -823,8 +1006,12 @@ ${gavenStyleHint}
         inputMode: 'text',
         sceneMode,
         gavenStyleCodes: isGavenSkill ? gavenStyleCodes : undefined,
+        dialogueMode,
+        variantCount,
+        generationMode,
       },
     };
+    let partialOutput = '';
 
     try {
       const res = await fetch('/api/h3-agent/generate-stream', {
@@ -862,6 +1049,7 @@ ${gavenStyleHint}
         if (event === 'delta') {
           if (videoGenerationControllerRef.current !== generationController) return;
           const kind = data.kind || 'content';
+          if (kind === 'content') partialOutput += data.text || '';
           setVideoRequestState((prev) => ({
             ...prev,
             streamStage: data.stage || '',
@@ -917,31 +1105,23 @@ ${gavenStyleHint}
         { role: 'assistant', content: finalData.structuredOutput?.englishPrompt || finalData.content },
       ]);
 
-      // Auto save to history
-      const now = new Date();
-      const newHistoryItem: PromptHistoryItem = {
-        id: `hist-${Date.now()}`,
-        createdAt: now.toLocaleString('zh-CN', {
-          year: 'numeric',
-          month: '2-digit',
-          day: '2-digit',
-          hour: '2-digit',
-          minute: '2-digit',
-        }),
-        createdAtIso: now.toISOString(),
-        historyDate: now.toISOString().slice(0, 10),
-        userQuery: promptText,
-        skillId: selectedSkillId,
-        structuredOutput: finalData.structuredOutput,
+      saveVideoHistory('success', finalData.structuredOutput, undefined, {
         resolvedParams: finalData.resolvedParams,
         gavenStyleCodes: isGavenSkill ? gavenStyleCodes || undefined : undefined,
         thinkingProcess: finalData.thinkingProcess,
         modelUsed: finalData.model || currentModelName,
-        isFavorite: false,
-      };
-      onSaveToHistory(newHistoryItem);
+      });
     } catch (err: any) {
+      const interruptedOutput = partialOutput.trim()
+        ? {
+            ...videoDraftOutput,
+            title: '视频提示词 · 未完成',
+            englishPrompt: partialOutput.trim(),
+            chineseTranslation: partialOutput.trim(),
+          }
+        : videoDraftOutput;
       if (err?.name === 'AbortError') {
+        saveVideoHistory('stopped', { ...interruptedOutput, title: '视频提示词 · 已停止' });
         if (videoGenerationControllerRef.current === generationController) {
           setVideoRequestState((prev) => ({ ...prev, streamStage: 'stopped', streamStatus: '已停止生成' }));
         }
@@ -949,9 +1129,11 @@ ${gavenStyleHint}
       }
       if (videoGenerationControllerRef.current === generationController) {
         console.error(err);
+        const message = err?.message || '无法连接后端 API 服务，请检查网络联通性或代理配置';
+        saveVideoHistory('error', { ...interruptedOutput, title: '视频提示词 · 生成失败' }, message);
         setVideoRequestState((prev) => ({
           ...prev,
-          errorMessage: err?.message || '无法连接后端 API 服务，请检查网络联通性或代理配置',
+          errorMessage: message,
         }));
       }
     } finally {
@@ -989,20 +1171,20 @@ ${gavenStyleHint}
   };
 
   const handleCopyFormattedForPlatform = (platform: string) => {
-    if (!structuredResult) return;
+    if (!activeVariant) return;
     let formatted = '';
     let nameLabel = '';
     if (platform === 'minimax') {
-      formatted = `${structuredResult.englishPrompt} --ar ${structuredResult.technicalParams.aspectRatio} --fps 24`;
+      formatted = `${activeVariant.englishPrompt} --ar ${activeVariant.technicalParams.aspectRatio} --fps 24`;
       nameLabel = 'MiniMax-H3 海螺';
     } else if (platform === 'runway') {
-      formatted = `${structuredResult.englishPrompt}, ${structuredResult.cameraMovement}, high quality photorealistic, 24fps`;
+      formatted = `${activeVariant.englishPrompt}, ${activeVariant.cameraMovement}, high quality photorealistic, 24fps`;
       nameLabel = 'Runway Gen-3';
     } else if (platform === 'sora') {
-      formatted = `[Cinematic Shot] ${structuredResult.englishPrompt}. Camera: ${structuredResult.cameraMovement}. Lighting: ${structuredResult.lightingAndAtmosphere}.`;
+      formatted = `[Cinematic Shot] ${activeVariant.englishPrompt}. Camera: ${activeVariant.cameraMovement}. Lighting: ${activeVariant.lightingAndAtmosphere}.`;
       nameLabel = 'OpenAI Sora';
     } else {
-      formatted = structuredResult.englishPrompt;
+      formatted = activeVariant.englishPrompt;
       nameLabel = '完整最终 Prompt';
     }
     handleCopy(formatted, platform, nameLabel);
@@ -1723,6 +1905,68 @@ ${gavenStyleHint}
           </div>
         </div>
 
+        {/* 视频生成新选项：对白模式 / 提示词组数 / 生成模式 */}
+        <div className="grid grid-cols-1 gap-1.5 border-t border-slate-800/80 pt-1.5 text-xs sm:grid-cols-3 xl:grid-cols-3">
+          {/* 对白模式 */}
+          <div className="space-y-0.5">
+            <label htmlFor="dialogue-mode" className="text-slate-400 flex items-center gap-1 text-[11px]">
+              <Volume2 className="w-3.5 h-3.5 text-emerald-400" />
+              <span>视频人声处理</span>
+            </label>
+            <select
+              id="dialogue-mode"
+              value={dialogueMode}
+              onChange={(e) => setDialogueMode(e.target.value as DialogueMode)}
+              className="w-full rounded-lg border border-slate-800 bg-slate-950 px-2 py-1 text-[11px] text-slate-200 focus:border-emerald-500 focus:outline-none"
+              title="控制视频中人物说话的形式；对白与旁白会写入画面时间线段，不会污染声音设计段"
+            >
+              <option value="auto">自动判断（由模型按画面意图）</option>
+              <option value="dialogue">角色对白（人物开口说话）</option>
+              <option value="voiceover">画外旁白（嘴唇保持闭合）</option>
+              <option value="lyrics">歌词演唱（人物唱歌）</option>
+              <option value="no-human-voice">无任何人声（纯环境声与动作声）</option>
+            </select>
+          </div>
+
+          {/* 提示词组数 */}
+          <div className="space-y-0.5">
+            <label htmlFor="variant-count" className="text-slate-400 flex items-center gap-1 text-[11px]">
+              <Layers className="w-3.5 h-3.5 text-cyan-400" />
+              <span>提示词组数</span>
+            </label>
+            <select
+              id="variant-count"
+              value={String(variantCount)}
+              onChange={(e) => setVariantCount(Number(e.target.value))}
+              className="w-full rounded-lg border border-slate-800 bg-slate-950 px-2 py-1 text-[11px] text-slate-200 focus:border-cyan-500 focus:outline-none"
+              title="同时生成多组差异化提示词，结果区可用 Tab 切换查看与复制"
+            >
+              <option value="1">1 组（默认）</option>
+              <option value="2">2 组（不同视角/节奏）</option>
+              <option value="3">3 组（远景/中景/特写）</option>
+              <option value="5">5 组（远景/中景/特写/俯视/仰视）</option>
+            </select>
+          </div>
+
+          {/* 生成模式 */}
+          <div className="space-y-0.5">
+            <label htmlFor="generation-mode" className="text-slate-400 flex items-center gap-1 text-[11px]">
+              <Brain className="w-3.5 h-3.5 text-purple-400" />
+              <span>生成模式</span>
+            </label>
+            <select
+              id="generation-mode"
+              value={generationMode}
+              onChange={(e) => setGenerationMode(e.target.value as PromptGenerationMode)}
+              className="w-full rounded-lg border border-slate-800 bg-slate-950 px-2 py-1 text-[11px] text-slate-200 focus:border-purple-500 focus:outline-none"
+              title="直接推理=单轮调用，已加载所选 Skill 完整规则（主文件+references），速度快；Agent 推理=多轮工具循环让模型自己读 Skill 资料，宽松输出不卡校验（适合自定义 Skill / 多组）"
+            >
+              <option value="direct">直接推理（单轮，已加载 Skill 完整规则）</option>
+              <option value="agent">Agent 推理（自主工具循环，宽松不卡校验）</option>
+            </select>
+          </div>
+        </div>
+
         {/* Gaven Cinematic Director style selectors */}
         {isGavenSkill && (
           <div className="space-y-1.5 border-t border-slate-800/80 pt-2 text-xs">
@@ -1886,6 +2130,44 @@ ${gavenStyleHint}
             </div>
             <div className="rounded-lg border border-slate-800 bg-slate-950/60 px-2 py-1 text-[10px] font-mono text-purple-300">
               {[imageDirectorStyle, imagePhotoStyle, imageCaptureFilm, imagePrintFilm, imageStyleIntensity].filter(Boolean).join('+') || '未选择画风'}
+            </div>
+
+            {/* 图片生成通用选项：组数 + 生成模式（与视频模式共享 state） */}
+            <div className="grid grid-cols-2 gap-1.5 border-t border-slate-800/80 pt-1.5">
+              <div className="space-y-0.5">
+                <label htmlFor="image-variant-count" className="text-slate-400 flex items-center gap-1 text-[11px]">
+                  <Layers className="w-3.5 h-3.5 text-cyan-400" />
+                  <span>提示词组数</span>
+                </label>
+                <select
+                  id="image-variant-count"
+                  value={String(variantCount)}
+                  onChange={(e) => setVariantCount(Number(e.target.value))}
+                  className="w-full rounded-lg border border-slate-800 bg-slate-950 px-2 py-1 text-[11px] text-slate-200 focus:border-cyan-500 focus:outline-none"
+                  title="同时生成多组差异化图片提示词，结果区可用 Tab 切换"
+                >
+                  <option value="1">1 组（默认）</option>
+                  <option value="2">2 组</option>
+                  <option value="3">3 组</option>
+                  <option value="5">5 组</option>
+                </select>
+              </div>
+              <div className="space-y-0.5">
+                <label htmlFor="image-generation-mode" className="text-slate-400 flex items-center gap-1 text-[11px]">
+                  <Brain className="w-3.5 h-3.5 text-purple-400" />
+                  <span>生成模式</span>
+                </label>
+                <select
+                  id="image-generation-mode"
+                  value={generationMode}
+                  onChange={(e) => setGenerationMode(e.target.value as PromptGenerationMode)}
+                  className="w-full rounded-lg border border-slate-800 bg-slate-950 px-2 py-1 text-[11px] text-slate-200 focus:border-purple-500 focus:outline-none"
+                  title="使用预设=走 Skill 工作流（JSON 解析+格式转换）；直接推理=单轮 LLM 输出（速度快，跳过解析）"
+                >
+                  <option value="preset">使用预设（Skill 工作流）</option>
+                  <option value="direct">直接推理（单轮 LLM）</option>
+                </select>
+              </div>
             </div>
           </div>
         )}
@@ -2281,18 +2563,62 @@ ${gavenStyleHint}
       {generatorMode === 'image' ? (
         imageResult ? (
           <div className="space-y-4 rounded-2xl border border-slate-800 bg-slate-900 p-6 shadow-2xl">
+            {/* 图片多组 Tab 切换（仅当存在 variants 数组时显示） */}
+            {(() => {
+              const variantList = imageResult.variants && imageResult.variants.length > 0
+                ? [imageResult, ...imageResult.variants]
+                : null;
+              if (!variantList || variantList.length <= 1) return null;
+              return (
+                <div className="flex flex-wrap items-center gap-1.5 rounded-xl border border-slate-800 bg-slate-950 p-1.5" role="tablist" aria-label="图片提示词组别切换">
+                  {variantList.map((variant, index) => {
+                    const isActive = index === activeVariantIndex;
+                    return (
+                      <button
+                        key={index}
+                        role="tab"
+                        aria-selected={isActive}
+                        onClick={() => setActiveVariantIndex(index)}
+                        className={`flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-[11px] font-bold transition-all ${
+                          isActive
+                            ? 'bg-gradient-to-r from-purple-600 to-cyan-600 text-white shadow-md'
+                            : 'text-slate-400 hover:bg-slate-800 hover:text-slate-200'
+                        }`}
+                        title={variant.variantDirection || `第 ${index + 1} 组`}
+                      >
+                        <span className="font-mono">#{index + 1}</span>
+                        {variant.variantDirection && (
+                          <span className="hidden sm:inline font-normal text-[10px] opacity-80">{variant.variantDirection}</span>
+                        )}
+                      </button>
+                    );
+                  })}
+                  <button
+                    type="button"
+                    onClick={() => {
+                      const combined = variantList.map((v, i) => `# 第 ${i + 1} 组${v.variantDirection ? `（${v.variantDirection}）` : ''}\n${v.target.prompt}`).join('\n\n---\n\n');
+                      handleCopy(combined, `image-all-variants-${Date.now()}`, `全部 ${variantList.length} 组`);
+                    }}
+                    className="ml-auto flex items-center gap-1 rounded-lg border border-cyan-800 bg-cyan-950/60 px-2 py-1.5 text-[10px] font-bold text-cyan-200 hover:bg-cyan-900"
+                  >
+                    {copiedKey?.startsWith('image-all-variants') ? <Check className="w-3 h-3" /> : <Copy className="w-3 h-3" />}
+                    <span>复制全部 {variantList.length} 组</span>
+                  </button>
+                </div>
+              );
+            })()}
             <div className="flex flex-col items-start justify-between gap-3 border-b border-slate-800 pb-4 sm:flex-row sm:items-center">
               <div className="space-y-1">
                 <div className="flex flex-wrap items-center gap-2">
                   <span className="rounded border border-emerald-800 bg-emerald-950 px-2 py-0.5 text-[10px] font-bold text-emerald-400">图片提示词生成成功</span>
-                  <span className="rounded border border-purple-800 bg-purple-950 px-2 py-0.5 text-[10px] font-mono text-purple-300">{imageResult.target.format}</span>
-                  <h3 className="text-base font-bold text-slate-100">{imageResult.canonical.title}</h3>
+                  <span className="rounded border border-purple-800 bg-purple-950 px-2 py-0.5 text-[10px] font-mono text-purple-300">{activeImageResult?.target.format}</span>
+                  <h3 className="text-base font-bold text-slate-100">{activeImageResult?.canonical.title}{imageResult.variants && imageResult.variants.length > 0 ? ` · 第 ${activeVariantIndex + 1} 组` : ''}</h3>
                 </div>
                 <p className="text-[11px] text-slate-400">
-                  Skill: <span className="font-mono text-cyan-300">{imageResult.matchedSkill}</span> · 模型: <span className="font-mono text-purple-300">{imageResult.model}</span>
+                  Skill: <span className="font-mono text-cyan-300">{activeImageResult?.matchedSkill}</span> · 模型: <span className="font-mono text-purple-300">{activeImageResult?.model}</span>
                 </p>
               </div>
-              <button onClick={() => handleCopy(imageResult.target.prompt, 'image-master', '图片提示词')} className="flex items-center gap-1.5 rounded-xl bg-gradient-to-r from-purple-600 to-cyan-600 px-4 py-2 text-xs font-bold text-white">
+              <button onClick={() => handleCopy(activeImageResult?.target.prompt || '', 'image-master', '图片提示词')} className="flex items-center gap-1.5 rounded-xl bg-gradient-to-r from-purple-600 to-cyan-600 px-4 py-2 text-xs font-bold text-white">
                 {copiedKey === 'image-master' ? <Check className="h-4 w-4" /> : <Copy className="h-4 w-4" />}复制图片提示词
               </button>
             </div>
@@ -2303,20 +2629,20 @@ ${gavenStyleHint}
             )}
             <div className="space-y-2 rounded-xl border border-slate-800 bg-slate-950 p-4">
               <div className="flex items-center justify-between text-xs font-bold text-purple-300">
-                <span>正向提示词 · {imageResult.target.format}</span>
-                <button onClick={() => handleCopy(imageResult.target.prompt, 'image-prompt')} className="text-slate-400 hover:text-purple-300">复制</button>
+                <span>正向提示词 · {activeImageResult?.target.format}</span>
+                <button onClick={() => handleCopy(activeImageResult?.target.prompt || '', 'image-prompt')} className="text-slate-400 hover:text-purple-300">复制</button>
               </div>
-              <p className="whitespace-pre-wrap break-words rounded-lg border border-slate-800 bg-slate-900 p-3.5 text-xs leading-relaxed text-slate-100">{imageResult.target.prompt}</p>
+              <p className="whitespace-pre-wrap break-words rounded-lg border border-slate-800 bg-slate-900 p-3.5 text-xs leading-relaxed text-slate-100">{activeImageResult?.target.prompt}</p>
             </div>
-            {imageResult.target.negativePrompt && (
+            {activeImageResult?.target.negativePrompt && (
               <div className="space-y-2 rounded-xl border border-slate-800 bg-slate-950 p-4">
-                <div className="flex items-center justify-between text-[11px] font-bold text-slate-400"><span>负面提示词</span><button onClick={() => handleCopy(imageResult.target.negativePrompt || '', 'image-negative')} className="hover:text-cyan-300">复制</button></div>
-                <p className="font-mono text-[11px] text-slate-300">{imageResult.target.negativePrompt}</p>
+                <div className="flex items-center justify-between text-[11px] font-bold text-slate-400"><span>负面提示词</span><button onClick={() => handleCopy(activeImageResult?.target.negativePrompt || '', 'image-negative')} className="hover:text-cyan-300">复制</button></div>
+                <p className="font-mono text-[11px] text-slate-300">{activeImageResult.target.negativePrompt}</p>
               </div>
             )}
             <div className="grid gap-3 text-[11px] sm:grid-cols-2">
-              <div className="rounded-xl border border-slate-800 bg-slate-950 p-3 text-slate-300">画幅：<span className="font-mono text-cyan-300">{imageResult.target.aspectRatio}</span><br />参数：<span className="font-mono text-slate-400">{JSON.stringify(imageResult.target.parameters)}</span></div>
-              <div className="rounded-xl border border-slate-800 bg-slate-950 p-3 text-slate-300">实际思考：<span className="font-bold text-purple-300">{imageResult.reasoning.applied ? `开启${imageResult.reasoning.effort ? ` / ${imageResult.reasoning.effort}` : ''}` : '关闭'}</span>{imageResult.reasoning.downgradeReason && <p className="mt-1 text-amber-300">{imageResult.reasoning.downgradeReason}</p>}</div>
+              <div className="rounded-xl border border-slate-800 bg-slate-950 p-3 text-slate-300">画幅：<span className="font-mono text-cyan-300">{activeImageResult?.target.aspectRatio}</span><br />参数：<span className="font-mono text-slate-400">{JSON.stringify(activeImageResult?.target.parameters)}</span></div>
+              <div className="rounded-xl border border-slate-800 bg-slate-950 p-3 text-slate-300">实际思考：<span className="font-bold text-purple-300">{activeImageResult?.reasoning.applied ? `开启${activeImageResult?.reasoning.effort ? ` / ${activeImageResult.reasoning.effort}` : ''}` : '关闭'}</span>{activeImageResult?.reasoning.downgradeReason && <p className="mt-1 text-amber-300">{activeImageResult.reasoning.downgradeReason}</p>}</div>
             </div>
           </div>
         ) : (
@@ -2328,6 +2654,53 @@ ${gavenStyleHint}
         )
       ) : structuredResult ? (
         <div className="rounded-2xl bg-slate-900 border border-slate-800 shadow-2xl p-6 space-y-6 animate-in fade-in duration-300">
+
+          {/* 多组提示词 Tab 切换（仅当存在 variants 数组时显示） */}
+          {(() => {
+            const variantList = structuredResult.variants && structuredResult.variants.length > 0
+              ? [structuredResult, ...structuredResult.variants]
+              : null;
+            if (!variantList || variantList.length <= 1) return null;
+            return (
+              <div className="flex flex-wrap items-center gap-1.5 rounded-xl border border-slate-800 bg-slate-950 p-1.5" role="tablist" aria-label="提示词组别切换">
+                {variantList.map((variant, index) => {
+                  const isActive = index === activeVariantIndex;
+                  return (
+                    <button
+                      key={variant.id || index}
+                      role="tab"
+                      aria-selected={isActive}
+                      onClick={() => setActiveVariantIndex(index)}
+                      className={`flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-[11px] font-bold transition-all ${
+                        isActive
+                          ? 'bg-gradient-to-r from-cyan-600 to-indigo-600 text-white shadow-md shadow-cyan-500/20'
+                          : 'text-slate-400 hover:bg-slate-800 hover:text-slate-200'
+                      }`}
+                      title={variant.variantDirection || `第 ${index + 1} 组`}
+                    >
+                      <span className="font-mono">#{index + 1}</span>
+                      {variant.variantDirection && (
+                        <span className="hidden sm:inline font-normal text-[10px] opacity-80">{variant.variantDirection}</span>
+                      )}
+                    </button>
+                  );
+                })}
+                <button
+                  type="button"
+                  onClick={() => {
+                    const variant = variantList[activeVariantIndex] || variantList[0];
+                    const combined = variantList.map((v, i) => `# 第 ${i + 1} 组${v.variantDirection ? `（${v.variantDirection}）` : ''}\n${v.englishPrompt}`).join('\n\n---\n\n');
+                    handleCopy(combined, `all-variants-${Date.now()}`, `全部 ${variantList.length} 组`);
+                  }}
+                  className="ml-auto flex items-center gap-1 rounded-lg border border-cyan-800 bg-cyan-950/60 px-2 py-1.5 text-[10px] font-bold text-cyan-200 hover:bg-cyan-900"
+                  title="把全部组别合并为带分隔线的文本复制"
+                >
+                  {copiedKey?.startsWith('all-variants') ? <Check className="w-3 h-3" /> : <Copy className="w-3 h-3" />}
+                  <span>复制全部 {variantList.length} 组</span>
+                </button>
+              </div>
+            );
+          })()}
           
           {/* Header */}
           <div className="flex flex-col items-start justify-between gap-3 border-b border-slate-800 pb-4 sm:flex-row sm:items-center">
@@ -2362,7 +2735,7 @@ ${gavenStyleHint}
             {/* One-click Prominent Copy Buttons */}
             <div className="flex items-center gap-2 flex-wrap">
               <button
-                onClick={() => handleCopy(structuredResult.englishPrompt, 'master', '最终 Prompt')}
+                onClick={() => handleCopy(activeVariant?.englishPrompt || structuredResult.englishPrompt, 'master', '最终 Prompt')}
                 className="px-4 py-2 rounded-xl text-xs font-bold bg-gradient-to-r from-cyan-600 to-indigo-600 hover:from-cyan-500 hover:to-indigo-500 text-white shadow-md shadow-cyan-500/20 flex items-center gap-1.5 cursor-pointer"
               >
                 {copiedKey === 'master' ? <Check className="w-4 h-4 text-emerald-300" /> : <Copy className="w-4 h-4" />}
@@ -2409,10 +2782,10 @@ ${gavenStyleHint}
             <div className="flex items-center justify-between">
               <span className="text-xs font-bold text-cyan-400 flex items-center gap-1.5">
                 <Film className="w-3.5 h-3.5" />
-                <span>MiniMax-H3 最终提示词</span>
+                <span>MiniMax-H3 最终提示词{structuredResult.variants && structuredResult.variants.length > 0 ? ` · 第 ${activeVariantIndex + 1} 组` : ''}</span>
               </span>
               <button
-                onClick={() => handleCopy(structuredResult.englishPrompt, 'master', '最终 Prompt')}
+                onClick={() => handleCopy(activeVariant?.englishPrompt || '', 'master', '最终 Prompt')}
                 className="text-xs text-slate-400 hover:text-cyan-300 flex items-center gap-1 font-mono"
               >
                 {copiedKey === 'master' ? <Check className="w-3.5 h-3.5 text-emerald-400" /> : <Copy className="w-3.5 h-3.5" />}
@@ -2420,7 +2793,7 @@ ${gavenStyleHint}
               </button>
             </div>
             <p className="whitespace-pre-wrap break-words rounded-lg border border-slate-800 bg-slate-900 p-3.5 font-sans text-xs leading-relaxed text-slate-100 select-all [overflow-wrap:anywhere]">
-              {structuredResult.englishPrompt}
+              {activeVariant?.englishPrompt}
             </p>
           </div>
 
@@ -2432,7 +2805,7 @@ ${gavenStyleHint}
                 <span>中文对照与画面分解</span>
               </span>
               <button
-                onClick={() => handleCopy(structuredResult.chineseTranslation, 'cn', '中文解析')}
+                onClick={() => handleCopy(activeVariant?.chineseTranslation || '', 'cn', '中文解析')}
                 className="text-xs text-slate-400 hover:text-purple-300 flex items-center gap-1 font-mono"
               >
                 {copiedKey === 'cn' ? <Check className="w-3.5 h-3.5 text-emerald-400" /> : <Copy className="w-3.5 h-3.5" />}
@@ -2440,7 +2813,7 @@ ${gavenStyleHint}
               </button>
             </div>
             <p className="whitespace-pre-wrap break-words rounded-lg border border-slate-800 bg-slate-900 p-3.5 text-xs leading-relaxed text-slate-200 select-all [overflow-wrap:anywhere]">
-              {structuredResult.chineseTranslation}
+              {activeVariant?.chineseTranslation}
             </p>
           </div>
           </div>
@@ -2453,7 +2826,7 @@ ${gavenStyleHint}
                 <Camera className="w-3.5 h-3.5 text-cyan-400" />
                 <span>运镜轨迹分析</span>
               </div>
-              <div className="text-slate-200 font-medium">{structuredResult.cameraMovement}</div>
+              <div className="text-slate-200 font-medium">{activeVariant?.cameraMovement}</div>
             </div>
 
             {/* Lighting & atmosphere */}
@@ -2462,7 +2835,7 @@ ${gavenStyleHint}
                 <Sun className="w-3.5 h-3.5 text-amber-400" />
                 <span>光影与粒子氛围</span>
               </div>
-              <div className="text-slate-200 font-medium">{structuredResult.lightingAndAtmosphere}</div>
+              <div className="text-slate-200 font-medium">{activeVariant?.lightingAndAtmosphere}</div>
             </div>
           </div>
 
@@ -2471,20 +2844,20 @@ ${gavenStyleHint}
             <div className="p-3.5 rounded-xl bg-slate-950 border border-slate-800 space-y-1">
               <div className="text-slate-400 font-medium flex items-center justify-between text-[11px]">
                 <span>负面排除项 (Negative Prompt)</span>
-                <button onClick={() => handleCopy(structuredResult.negativePrompt, 'neg', '负面词')} className="hover:text-cyan-300 font-mono">复制</button>
+                <button onClick={() => handleCopy(activeVariant?.negativePrompt || '', 'neg', '负面词')} className="hover:text-cyan-300 font-mono">复制</button>
               </div>
               <div className="font-mono text-[11px] text-slate-400 bg-slate-900 p-2 rounded-lg border border-slate-800">
-                {structuredResult.negativePrompt}
+                {activeVariant?.negativePrompt}
               </div>
             </div>
 
-            {structuredResult.soundCue && (
+            {activeVariant?.soundCue && (
               <div className="p-3.5 rounded-xl bg-slate-950 border border-slate-800 space-y-1">
                 <div className="text-slate-400 font-medium flex items-center gap-1.5 text-[11px]">
                   <Volume2 className="w-3.5 h-3.5 text-emerald-400" />
                   <span>音效配乐设计建议 (Sound Design)</span>
                 </div>
-                <div className="text-slate-300">{structuredResult.soundCue}</div>
+                <div className="text-slate-300">{activeVariant.soundCue}</div>
               </div>
             )}
           </div>

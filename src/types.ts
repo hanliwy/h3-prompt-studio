@@ -7,6 +7,12 @@ export type H3SceneMode = 'drama' | 'action' | 'storyboard-grid';
 export type GeneratorMode = 'video' | 'image';
 export type ImagePromptFormat = 'generic' | 'midjourney' | 'flux' | 'sdxl' | 'jimeng' | 'doubao';
 
+// 视频中人声的处理方式：自动判断/角色对白/画外旁白/歌词演唱/无任何人声
+export type DialogueMode = 'auto' | 'dialogue' | 'voiceover' | 'lyrics' | 'no-human-voice';
+
+// 提示词生成模式：preset=完整 Skill Agent 状态机（强校验）；direct=单轮 LLM 绕过状态机；agent=自主工具循环（宽松，不卡校验）
+export type PromptGenerationMode = 'preset' | 'direct' | 'agent';
+
 export type CameraMotion = 
   | 'static'
   | 'pan_left'
@@ -143,6 +149,10 @@ export interface ImagePromptResult {
   target: ImagePromptTarget;
   reasoning: ReasoningUsage;
   model: string;
+  // 多组图片提示词时存放其余组
+  variants?: ImagePromptResult[];
+  variantIndex?: number;
+  variantDirection?: string;
 }
 
 export interface StructuredPromptOutput {
@@ -160,8 +170,14 @@ export interface StructuredPromptOutput {
     aspectRatio: AspectRatio;
     fps: number;
     duration: string;
-    motionSpeed: number; // 1-10
+    motionSpeed: number;
   };
+  // 多组提示词时存放其余组；当前默认组直接挂在 StructuredPromptOutput 顶层
+  variants?: StructuredPromptOutput[];
+  // 本组序号（从 1 开始），单组时省略
+  variantIndex?: number;
+  // 本组差异化方向说明（例如"远景为主，慢推镜头"）
+  variantDirection?: string;
 }
 
 export interface H3PromptVariant {
@@ -223,6 +239,8 @@ export interface PromptHistoryItem {
   createdAt: string;
   createdAtIso?: string;
   historyDate?: string;
+  generationStatus?: 'pending' | 'success' | 'error' | 'stopped';
+  errorMessage?: string;
   userQuery: string;
   skillId?: StylePreset;
   structuredOutput: StructuredPromptOutput;
@@ -332,4 +350,10 @@ export interface PromptGenInputOptions {
   gavenCaptureFilm?: string;
   gavenPrintFilm?: string;
   gavenStyleIntensity?: string;
+  // 视频中人声处理方式
+  dialogueMode?: DialogueMode;
+  // 提示词组数（1/2/3）
+  variantCount?: number;
+  // 生成模式：预设工作流 / 直接推理
+  generationMode?: PromptGenerationMode;
 }

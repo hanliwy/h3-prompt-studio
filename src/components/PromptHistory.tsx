@@ -160,6 +160,25 @@ export const PromptHistory: React.FC<PromptHistoryProps> = ({
                     <span className="px-2 py-0.5 rounded text-[10px] font-mono bg-purple-950 text-purple-300 border border-purple-800">
                       {item.modelUsed}
                     </span>
+                    {item.generationStatus && (
+                      <span className={`px-2 py-0.5 rounded text-[10px] font-mono border ${
+                        item.generationStatus === 'pending'
+                          ? 'bg-cyan-950/60 text-cyan-300 border-cyan-800/70'
+                          : item.generationStatus === 'success'
+                            ? 'bg-emerald-950/60 text-emerald-300 border-emerald-800/70'
+                            : item.generationStatus === 'stopped'
+                              ? 'bg-amber-950/60 text-amber-300 border-amber-800/70'
+                              : 'bg-rose-950/60 text-rose-300 border-rose-800/70'
+                      }`}>
+                        {item.generationStatus === 'pending'
+                          ? '生成中'
+                          : item.generationStatus === 'success'
+                            ? '已完成'
+                            : item.generationStatus === 'stopped'
+                              ? '已停止'
+                              : '生成失败'}
+                      </span>
+                    )}
                     {item.gavenStyleCodes && (
                       <span className="px-2 py-0.5 rounded text-[10px] font-mono bg-amber-950/60 text-amber-300 border border-amber-800/70">
                         画风: {item.gavenStyleCodes}
@@ -192,12 +211,18 @@ export const PromptHistory: React.FC<PromptHistoryProps> = ({
                 </div>
               </div>
 
+              {item.errorMessage && (
+                <p className="text-xs text-rose-300 bg-rose-950/30 p-3 rounded-xl border border-rose-900/50">
+                  {item.errorMessage}
+                </p>
+              )}
+
               {/* Master English Prompt */}
               <div className="space-y-1.5">
                 <div className="flex items-center justify-between text-xs">
                   <span className="font-semibold text-cyan-400 flex items-center gap-1">
                     <Film className="w-3.5 h-3.5" />
-                    <span>英文主提示词</span>
+                    <span>{item.generationStatus && item.generationStatus !== 'success' ? '已保存内容' : '英文主提示词'}</span>
                   </span>
 
                   <button

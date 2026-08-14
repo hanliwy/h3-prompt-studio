@@ -3,28 +3,36 @@ import { MiniMaxSkill } from '../types';
 export const MINIMAX_SKILLS: MiniMaxSkill[] = [
   {
     id: 'general_master',
-    title: '通用物理大师 (默认无特定风格偏向)',
-    titleEn: 'General Physical & Camera Master',
+    title: '通用六段式全能简写 (默认无特定风格偏向)',
+    titleEn: 'General Six-Section Master',
     category: '标准基础',
     icon: 'Sparkles',
-    description: 'MiniMax-H3 官方标准底层框架。不强行叠加特定艺术视角，精准保留你的原始创意，专注于物理运动力学、低震动画面平滑度与自然光影。',
-    systemPrompt: `You are the core MiniMax-H3 (Hailuo AI) Master Prompt Generator.
-Your mandate is to refine user ideas into clean, highly realistic video prompt directives WITHOUT forcing any arbitrary aesthetic style (like cyberpunk or anime unless requested).
+    description: '官方全参考模式六段式（主体定义/任务概述/保留分析/画面描述/环境声/配乐）的中文精简版，结构完整、长度可控，适合没有参考素材的快速文生视频。',
+    systemPrompt: `You are the MiniMax-H3 General Six-Section Master.
+Output a concise Chinese prompt with exactly six labeled sections in this order:
+1. 主体定义：1-2 sentences defining subjects (people, products, scenes, props). When no reference assets are provided, virtualize subjects consistent with the user's intent.
+2. 任务概述：1 sentence summarizing video type, goal and main visual relations.
+3. 保留分析：1-2 sentences on how subjects are preserved or evolve across the timeline.
+4. 画面描述：The core section. Timeline covering 0-{duration} seconds with no gaps, each segment labeled "0-N秒（第X段·...）：". Order within each segment: shot & angle → composition → subject → action & expression → spatial staging → environment → light & color → camera motion. Dialogue, voiceover and lyrics MUST live inside this section in double quotes; never put them in the audio section.
+5. 环境声：1-2 sentences on ambient and physical sounds (wind, rain, footsteps, fabric, breath, laugh). Do NOT repeat dialogue, singing or on-screen music here.
+6. 配乐：1 sentence on non-diegetic music (instruments, tempo, dynamics) or "配乐：N/A".
 
-Follow these MiniMax-H3 core prompt architecture rules:
-1. Subject & Action Physics: Precise micro-movements, clothing/cloth simulation, hair physics, environmental interaction.
-2. Camera Mechanics: Clean camera trajectory (dolly, orbit, tracking), lens specification, depth of field.
-3. Natural Light & Texture: Realistic reflections, volumetric light, skin/surface texture.
-4. Output JSON strictly adhering to schema.`,
+Rules:
+- First line must be "生成一段{时长}、{画幅}、2K、原生立体声。" followed by a blank line.
+- Total length 250-450 Chinese characters.
+- Use plain visible descriptions only; no "8K render", "ultra-detailed", "photorealistic render".
+- Double quotes only mark: ① dialogue/lyrics actually spoken or sung, ② on-screen visible text.
+- Default aspect 16:9; portrait for character/poster, square for product still life.
+- End with 0.4-1.2s showing the final result or emotional aftertaste.`,
     sampleInput: '一只白色萨摩耶犬在落满黄叶的公园小径上欢快奔跑，树叶随风飘落',
     recommendedParams: {
       cameraMotion: 'tracking_shot',
       lens: '35mm_anamorphic',
       lighting: 'sunlit_natural',
       fps: 30,
-      duration: '6s',
+      duration: '10s',
     },
-    tags: ['官方标准', '无风格强加', '真实物理', '通用偏好'],
+    tags: ['通用预设', '六段式', '全能简写', '中文成品'],
   },
   {
     id: 'cinematic_imax',

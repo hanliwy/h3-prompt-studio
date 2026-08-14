@@ -184,10 +184,28 @@ function buildSystemPrompt(
   const gavenStyleBlock = options.gavenStyleCodes
     ? `\n用户指定画风组合：${options.gavenStyleCodes}。必须从上方 Skill 的画风参考文件中读取对应条目，把 Dxx（导演视觉语言）、Pxx（摄影风格）、Cxx（拍摄胶片）、Rxx（印片风格）与 S（强度）每一层都完整展开为自包含的自然视觉语言，写入成品的"视觉风格"段。不得遗漏任何选定的画风层级，不得用导演姓名或画风代码代替具体描述。展开后不得在成品中保留任何画风代码、括号标注（如（D13）（P03））或"受……启发"引用。`
     : '';
+  const dialogueBlock = (() => {
+    switch (options.dialogueMode) {
+      case 'dialogue':
+        return '\n对白模式：人物必须在画面中实际开口说话，台词用中文双引号 "…" 包裹写入对应时段的画面/时间线段（不得放进声音段）。若用户未提供具体台词，按画面意图补全一句自然对白。';
+      case 'voiceover':
+        return '\n旁白模式：使用画外音 voiceover，台词用中文双引号 "…" 包裹写入画面/时间线段，并明确说明"画面中人物嘴唇保持完全闭合"。台词不得放进声音段。';
+      case 'lyrics':
+        return '\n歌词演唱模式：人物必须在画面中实际唱歌，歌词用中文双引号 "…" 包裹写入画面/时间线段；多个角色合唱时合并说话者描述。歌词不得放进声音段。';
+      case 'no-human-voice':
+        return '\n无任何人声模式：全文不得出现任何对白、旁白、歌词或人声演唱；声音段只描述环境声、动作声与配乐。';
+      case 'auto':
+      default:
+        return '\n对白模式：自动判断。若用户原话或画面意图暗示人物说话，按对白规则写入画面段；否则保留为纯环境声。';
+    }
+  })();
+  const variantBlock = (options.variantCount && options.variantCount > 1)
+    ? `\n本次需要生成 ${options.variantCount} 组差异化提示词。每组保持核心创意与主体身份一致，但使用不同的镜头组合、视角、调度与节奏方向（例如：组1 远景慢推/组2 中景横移/组3 特写跟随）。每组都必须独立通过 Skill 专属校验。`
+    : '';
   const nativeSkillDirective = config.outputFormat === 'native-skill'
     ? '本 Skill 为中文原生格式：result.promptEn 与 result.promptCn 必须完全相同，都输出同一份完整中文成品（首行以"生成一段"开头）。result.promptEn 严禁翻译成英文。'
     : '最终成品 result.promptEn 使用英文，result.promptCn 使用中文。';
-  return `你是 MiniMax-H3 视频提示词执行器。服务器已锁定唯一 Skill 并加载全部必需规则，不做路由，不向用户提问，不返回候选，不输出工作流草稿。${gavenStyleBlock}
+  return `你是 MiniMax-H3 视频提示词执行器。服务器已锁定唯一 Skill 并加载全部必需规则，不做路由，不向用户提问，不返回候选，不输出工作流草稿。${gavenStyleBlock}${dialogueBlock}${variantBlock}
 
 重要：不要输出冗长的思考过程、大纲、自检表或分镜规划文本。直接调用 submit_generated_prompt 提交完整成品。内容部分（result.promptEn）必须包含完整提示词，不要把提示词写在中间分析里。
 如果需要输出任何中间文本（包括思考过程），请全部使用中文。${nativeSkillDirective}

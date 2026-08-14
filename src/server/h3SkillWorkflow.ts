@@ -11,7 +11,8 @@ export type H3SkillValidatorKind =
   | 'papercraft'
   | '3d-animation'
   | 'brand-promo'
-  | 'multimode';
+  | 'multimode'
+  | 'six-section';
 
 export interface H3SkillWorkflowConfig {
   requiredRuntimeFiles: string[];
@@ -52,6 +53,13 @@ export const H3_SKILL_WORKFLOW_CONFIG: Record<string, H3SkillWorkflowConfig> = {
     requiredRuntimeFiles: ['SKILL.md', 'references/base-en.txt'],
     outputFormat: 'h3-base',
     validator: 'h3-base',
+    requiresSceneMode: false,
+    supportedInputModes: ['text', 'image'],
+  },
+  'h3-general-six-section': {
+    requiredRuntimeFiles: ['SKILL.cn.md'],
+    outputFormat: 'native-skill',
+    validator: 'six-section',
     requiresSceneMode: false,
     supportedInputModes: ['text', 'image'],
   },
@@ -168,6 +176,11 @@ function expectedTimelineRange(
   }
   if (skillId === 'brand-promo-video-generator' && seconds <= 15) return [5, 8];
   if (skillId === '3d-animation-short-generator') return [2, 12];
+  if (skillId === 'h3-general-six-section') {
+    if (seconds <= 6) return [2, 3];
+    if (seconds <= 10) return [3, 4];
+    return [3, 5];
+  }
 
   if (skillId.startsWith('h3-multimode-')) {
     if (sceneMode === 'storyboard-grid') return [9, 9];
@@ -341,6 +354,27 @@ function validateNativePrompt(
   return { isValid: issues.length === 0, issues };
 }
 
+function validateSixSection(promptText: string, duration: string): H3SkillValidationResult {
+  const issues: string[] = [];
+  const seconds = parseDurationSeconds(duration);
+  const normalized = promptText.replace(/[\u2014\u2013\u2012\u2015]/g, '-');
+  if (!normalized.trim().startsWith(`生成一段`)) {
+    issues.push('最终提示词必须以"生成一段"开头。');
+  }
+  if (!new RegExp(`${seconds}秒`).test(normalized)) {
+    issues.push(`最终提示词应明确目标时长 ${seconds} 秒。`);
+  }
+  requireFragments(
+    normalized,
+    ['主体定义：', '任务概述：', '保留分析：', '画面描述：', '环境声：', '配乐：'],
+    issues,
+  );
+  if (!normalized.includes('0-') || !normalized.includes(`-${seconds}秒`)) {
+    issues.push(`画面描述段的时间线必须无缺口覆盖 0-${seconds} 秒。`);
+  }
+  return { isValid: issues.length === 0, issues };
+}
+
 export function validateSkillOutput(args: {
   skillId: string;
   promptText: string;
@@ -351,6 +385,9 @@ export function validateSkillOutput(args: {
   const config = getH3SkillWorkflowConfig(args.skillId);
   if (config.validator === 'h3-base') return validateBaseH3Prompt(args.promptText, args.duration);
   if (config.validator === 'handdrawn-live') return validateHanddrawn(args.promptText, args.duration);
+  if (config.validator === 'six-section') {
+    return validateSixSection(args.promptText, config.fixedDuration || args.duration);
+  }
   if (config.validator === 'multimode') {
     return validateMultimode(
       args.promptText,

@@ -3,7 +3,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 
 const componentPath = path.join(process.cwd(), 'src', 'components', 'PromptGenerator.tsx');
-const source = fs.readFileSync(componentPath, 'utf8');
+const source = fs.readFileSync(componentPath, 'utf8').replace(/\r\n/g, '\n');
 
 const skillsIndex = source.indexOf('data-workspace-column="skills"');
 const composerControlsIndex = source.indexOf('data-workspace-column="composer-controls"');
